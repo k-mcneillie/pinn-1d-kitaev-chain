@@ -15,7 +15,10 @@ dependencies:
   # Visualisation
   - matplotlib
   - seaborn
+  - ipywidgets
+  - ipympl
   - ipython
+
   
   # ML stack
   - pytorch
