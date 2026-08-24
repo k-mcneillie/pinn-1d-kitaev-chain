@@ -1,11 +1,15 @@
 # tests/test_hamiltonian.py
 from __future__ import annotations
-import numpy as np
+
 from unittest import TestCase
-from numpy.linalg import eigvalsh, matrix_rank
+
+import numpy as np
+from numpy.linalg import eigvalsh
+
 from kitaev.analytical import KitaevChainHamiltonian
 
-class TestKitaevChainHamiltonian(TestCase):
+
+class TestKitaevChainHamiltonian(TestCase):  # noqa: N806
     """
     Comprehensive test suite for the KitaevChainHamiltonian class.
     """
@@ -112,15 +116,15 @@ class TestKitaevChainHamiltonian(TestCase):
         h = KitaevChainHamiltonian(hopping=0.0)
         H = h.build(0.5)
         N = h.n_sites
-    
+
         # on-site terms: particle sector is -mu, hole sector is +mu
         self.assertTrue(np.isclose(H[0, 0], -0.5))
         self.assertTrue(np.isclose(H[N, N], 0.5))
-    
+
         # hopping off-diagonals should be exactly zero
         self.assertTrue(np.isclose(H[0, 1], 0.0))
         self.assertTrue(np.isclose(H[N, N + 1], 0.0))
-    
+
         # pairing terms should be unaffected by hopping=0
         self.assertTrue(np.isclose(H[0, N + 1], h.pairing))
 
@@ -149,6 +153,8 @@ class TestKitaevChainHamiltonian(TestCase):
         H2 = h(0.5)
         self.assertTrue(np.array_equal(H1, H2))
 
+
 if __name__ == "__main__":
     import pytest
+
     pytest.main()
