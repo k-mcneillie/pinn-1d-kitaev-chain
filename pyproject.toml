@@ -1,0 +1,94 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-project-name"
+version = "0.1.0"
+description = "A short description of the project"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" } # Added: Clear licensing boilerplate
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+classifiers = [ # Added: Standard PyPI categorisation metadata
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "torch>=2.0.0",
+    "sesh @ git+https://github.com/k-mcneillie/sesh.git@main"
+]
+
+
+[project.urls] # Added: Helpful navigation links for users/maintainers
+Homepage = "https://github.com/k-mcneillie/"
+Documentation = "https://github.com/k-mcneillie/"
+Repository = "https://github.com.git"
+Issues = "https://github.com/k-mcneillie/"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0", # Added: Required for generating coverage reports
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",       # Added: Required for static type checking
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# Updated: Added coverage flags so running 'pytest' automatically tracks coverage
+addopts = "-ra --strict-markers --cov=src --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run] # Added: Scope coverage tracking precisely to your source code
+source = ["src"]
+omit = ["tests/*"]
+
+[tool.coverage.report] # Added: Enforce clean reporting and quality thresholds
+show_missing = true
+skip_covered = true
+fail_under = 80 # Optional: Fails the build if test coverage drops below 80%
+
+[tool.mypy] # Added: Strict type checking config to catch errors early
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true # Enforces writing type hints for functions
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = "sesh.*"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # Error
+    "F",   # Pyflakes
+    "I",   # Isort
+    "B",   # Bugbear
+    "UP",  # Pyupgrade
+    "C90", # Mccabe code complexity
+    "C4",  # Flake8-comprehensions
+    "N",   # Added: PEP8 Naming conventions (e.g., classes must be PascalCase)
+    "SIM", # Added: Flake8-simplify (helps you write cleaner, shorter logic)
+    "ARG", # Added: Unused arguments (catches dead variables in functions)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

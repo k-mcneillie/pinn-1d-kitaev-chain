@@ -1,0 +1,59 @@
+# ==========================================
+# 🐍 Python & Tooling Environment
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.env
+.venv
+
+# ==========================================
+# 🔬 Scientific Computing & Caches
+# ==========================================
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# ==========================================
+# 📊 Data & Model Weights (Crucial for Science)
+# ==========================================
+# Block massive raw datasets, trained models, and heavy artifacts
+data/raw/
+data/processed/
+*.csv
+*.tsv
+*.hdf5
+*.h5
+*.npy
+*.npz
+*.parquet
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Exception: Allow specific tracking metadata if needed
+!data/README.md
+
+# ==========================================
+# 💻 IDE & OS Clutter
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
