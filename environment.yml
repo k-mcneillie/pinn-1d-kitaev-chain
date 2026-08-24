@@ -4,7 +4,8 @@ channels:
   - defaults
 dependencies:
   - python=3.12
-  
+  - ipykernal
+
   # Core Scientific Stack
   - numpy
   - scipy
@@ -14,6 +15,7 @@ dependencies:
   # Visualisation
   - matplotlib
   - seaborn
+  - ipython
   
   # ML stack
   - pytorch
