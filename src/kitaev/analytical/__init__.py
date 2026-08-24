@@ -1,3 +1,3 @@
 from .hamiltonian import KitaevChainHamiltonian
 
-__all__ = ['KitaevChainHamiltonian']
+__all__ = ["KitaevChainHamiltonian"]
