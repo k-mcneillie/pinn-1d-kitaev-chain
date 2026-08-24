@@ -3,21 +3,16 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "my-project-name"
+name = "pinn-1d-kitaev-chain"
 version = "0.1.0"
-description = "A short description of the project"
+description = "This repo contains the code and experiments for solving the 1D Kitaev chain through semi-supervised and unsupervised methods."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" } # Added: Clear licensing boilerplate
 authors = [
-    { name = "Your Name", email = "your.email@example.com" }
+    { name = "Konner McNeillie", email = "john.doe@gmail.com" }
 ]
 classifiers = [ # Added: Standard PyPI categorisation metadata
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 
@@ -27,12 +22,10 @@ dependencies = [
     "sesh @ git+https://github.com/k-mcneillie/sesh.git@main"
 ]
 
-
 [project.urls] # Added: Helpful navigation links for users/maintainers
-Homepage = "https://github.com/k-mcneillie/"
-Documentation = "https://github.com/k-mcneillie/"
-Repository = "https://github.com.git"
-Issues = "https://github.com/k-mcneillie/"
+Homepage = "https://github.com/k-mcneillie/pinn-1d-kitaev-chain"
+Repository = "https://github.com/k-mcneillie/pinn-1d-kitaev-chain.git"
+Issues = "https://github.com/k-mcneillie/pinn-1d-kitaev-chain/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -73,7 +66,7 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
