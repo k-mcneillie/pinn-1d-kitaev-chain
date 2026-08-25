@@ -19,6 +19,7 @@ classifiers = [ # Added: Standard PyPI categorisation metadata
 dependencies = [
     "numpy>=1.24.0",
     "torch>=2.0.0",
+    "accelerate>=0.30.0",
     "sesh @ git+https://github.com/k-mcneillie/sesh.git@main"
 ]
 
@@ -62,6 +63,10 @@ disallow_incomplete_defs = true
 
 [[tool.mypy.overrides]]
 module = "sesh.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "accelerate.*"
 ignore_missing_imports = true
 
 [tool.ruff]
