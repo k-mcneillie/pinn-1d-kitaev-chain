@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import numpy as np
 
+
 class KitaevChainHamiltonian:
     """Build the Bogoliubov-de Gennes (BdG) Hamiltonian for a 1D Kitaev chain.
 
