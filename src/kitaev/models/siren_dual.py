@@ -147,10 +147,15 @@ class SirenPINNDualHead(nn.Module):
         """
         super().__init__()
 
+        self.n_sites = n_sites
+        self.in_features = in_features
+        self.hidden_features = hidden_features
+        self.hidden_layers = hidden_layers
+
         layers = [
             SineLayer(
-                in_features,
-                hidden_features,
+                self.in_features,
+                self.hidden_features,
                 is_first=True,
                 omega_0=30.0,
             )
@@ -159,8 +164,8 @@ class SirenPINNDualHead(nn.Module):
         for _ in range(hidden_layers):
             layers.append(
                 SineLayer(
-                    hidden_features,
-                    hidden_features,
+                    self.hidden_features,
+                    self.hidden_features,
                     is_first=False,
                     omega_0=2.0,
                 )
@@ -169,12 +174,12 @@ class SirenPINNDualHead(nn.Module):
         self.net = nn.Sequential(*layers)
 
         # Separate prediction heads.
-        self.energy_head = nn.Linear(hidden_features, 1)
-        self.psi_head = nn.Linear(hidden_features, n_sites)
+        self.energy_head = nn.Linear(self.hidden_features, 1)
+        self.psi_head = nn.Linear(self.hidden_features, self.n_sites)
 
         # Use the SIREN-style scaling associated with the hidden-layer
         # frequency omega_0 = 2.0 for the linear prediction heads.
-        bound = math.sqrt(6.0 / hidden_features) / 2.0
+        bound = math.sqrt(6.0 / self.hidden_features) / 2.0
 
         with torch.no_grad():
             self.energy_head.weight.uniform_(-bound, bound)
@@ -223,7 +228,53 @@ class SirenPINNDualHead(nn.Module):
         energy_pred = self.energy_head(features)
         psi_pred = self.psi_head(features)
 
-        # Explicit L2 normalisation of the predicted eigenvector.
+        # Eigenvector normalisation
+        # -------------------------
+        # The psi head predicts an eigenvector in the BdG vector space:
+        #
+        #     Psi_pred in R^(2N)
+        #
+        # However, an eigenvector has an arbitrary overall scale. If Psi
+        # is an eigenvector of H, then c * Psi is also an eigenvector for
+        # any non-zero scalar c.
+        #
+        # Exact diagonalisation conventionally returns normalised
+        # eigenvectors satisfying:
+        #
+        #     ||Psi||^2 = 1
+        #
+        # We therefore enforce this known mathematical constraint directly
+        # in the architecture rather than asking the PINN loss to learn it.
+        #
+        # The normalisation maps the unconstrained prediction onto the
+        # unit sphere in the BdG vector space:
+        #
+        #     Psi_hat = Psi_pred / ||Psi_pred||_2
+        #
+        # For N = 20 sites, the BdG space has dimension 2N = 40, so the
+        # predicted eigenvector lies in R^40 and the normalised prediction
+        # lies on the 39-dimensional unit sphere:
+        #
+        #     S^39 = {Psi in R^40 : ||Psi||_2 = 1}.
+        #
+        # This is an architectural constraint on the representation of
+        # the eigenvector. It does NOT constrain the entire eigenvector
+        # space to a single state, nor does it determine which eigenvector
+        # the network should predict.
+        #
+        # The physical eigenvalue/eigenvector relationship is still
+        # enforced separately through the PINN physics residual:
+        #
+        #     H(mu) Psi_hat(mu) - E_pred(mu) Psi_hat(mu) = 0.
+        #
+        # One remaining ambiguity is the global sign: Psi and -Psi
+        # represent the same eigenstate. L2 normalisation removes the
+        # arbitrary magnitude but not this sign ambiguity.
+        #
+        # Normalisation is therefore an eigenvector constraint arising
+        # from the spectral problem, not a requirement of the SIREN
+        # architecture itself.
+        # ================================================================
         psi_pred = F.normalize(
             psi_pred,
             p=2,
