@@ -427,7 +427,7 @@ class _ExampleSirenStandIn(nn.Module):
         return normalised
 
 
-def main() -> None:
+def main() -> None:  # pragma: no cover
     """End-to-end example: build operators, model, and trainer, then fit.
 
     This is the "step 3, right before training" orchestration point
@@ -482,5 +482,5 @@ def main() -> None:
     print({key: values[-1] for key, values in trainer.history.as_dict().items()})
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()
