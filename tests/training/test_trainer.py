@@ -7,8 +7,13 @@ import math
 import pytest
 import torch
 
+from kitaev.analytical import KitaevChainHamiltonian
+from kitaev.data.generators.supervised import SupervisedKitaevDataset
+from kitaev.data.generators.unsupervised import UnsupervisedMuGenerator
+from kitaev.data.mu_sampler import DEFAULT_KITAEV_REGIONS, MuSampler
+from kitaev.models import SirenPINNDualHead
 from kitaev.training.config import TrainerConfig
-from kitaev.training.loss.losses import PinnedFSMLoss
+from kitaev.training.loss.losses import PinnedFSMLoss, SemiSupervisedLoss
 from kitaev.training.trainer import (
     UnifiedTrainer,
     _build_kitaev_operators,
@@ -73,6 +78,72 @@ def trainer_factory(accelerator, tiny_model_factory, make_session):
 def mu_batch(accelerator) -> torch.Tensor:
     """A small, real mu batch already placed on the accelerator's device."""
     return (torch.rand(4, 1) * 6.0 - 3.0).to(accelerator.device)
+
+
+@pytest.fixture
+def labeled_loader_factory(n_sites):
+    """Factory for real, exactly-labelled `(mu, energy, psi)` dataloaders.
+
+    Uses the same `n_sites` as `kitaev_operators`, so labels are shaped
+    consistently with the Hamiltonian pieces a semi-supervised test
+    passes alongside them.
+    """
+    hamiltonian = KitaevChainHamiltonian(n_sites=n_sites, hopping=1.0, pairing=0.5)
+
+    def _make(total_samples: int = 4, batch_size: int = 4):
+        sampler = MuSampler(DEFAULT_KITAEV_REGIONS)
+        dataset = SupervisedKitaevDataset(sampler, total_samples, hamiltonian)
+        return dataset.dataloader(batch_size=batch_size, shuffle=False)
+
+    return _make
+
+
+@pytest.fixture
+def unlabeled_loader_factory():
+    """Factory for real, label-free mu-only dataloaders."""
+
+    def _make(total_samples: int = 8, batch_size: int = 4):
+        sampler = MuSampler(DEFAULT_KITAEV_REGIONS)
+        generator = UnsupervisedMuGenerator(sampler=sampler)
+        return generator.dataloader(total_samples=total_samples, batch_size=batch_size)
+
+    return _make
+
+
+@pytest.fixture
+def semi_supervised_trainer_factory(accelerator, make_session, n_sites):
+    """Factory building a real `UnifiedTrainer` wired for `SemiSupervisedLoss`.
+
+    Separate from `trainer_factory` because `SemiSupervisedLoss` needs a
+    dual-head model (predicting both energy and psi), unlike the
+    single-head `_ExampleSirenStandIn` used everywhere else in this file.
+    """
+
+    def _make(config=_UNSET) -> tuple[UnifiedTrainer, object]:
+        model = SirenPINNDualHead(
+            n_sites=2 * n_sites, hidden_features=4, hidden_layers=1
+        ).to(accelerator.device)
+        optimiser = torch.optim.AdamW(model.parameters(), lr=1e-2)
+
+        if config is _UNSET:
+            config = TrainerConfig(
+                epochs=2, print_freq=1000, patience=None, grad_clip_norm=1.0
+            )
+
+        session = make_session()
+
+        trainer = UnifiedTrainer(
+            session=session,
+            accelerator=accelerator,
+            model=model,
+            loss_fn=SemiSupervisedLoss(),
+            optimiser=optimiser,
+            scheduler=None,
+            config=config,
+        )
+        return trainer, session
+
+    return _make
 
 
 def _read_log(session) -> str:
@@ -228,6 +299,80 @@ def test_fit_early_stopping_triggers_and_breaks(
 
 
 # ---------------------------------------------------------------------------
+# fit() with unlabeled_loader (semi-supervised)
+# ---------------------------------------------------------------------------
+
+
+def test_fit_with_unlabeled_loader_trains_semi_supervised_loss(
+    semi_supervised_trainer_factory,
+    labeled_loader_factory,
+    unlabeled_loader_factory,
+    kitaev_operators,
+) -> None:
+    trainer, _ = semi_supervised_trainer_factory()
+    H_base, H_mu_diag, Xi = kitaev_operators
+    train_loader = labeled_loader_factory(total_samples=4, batch_size=4)
+    unlabeled_loader = unlabeled_loader_factory(total_samples=8, batch_size=4)
+
+    trainer.fit(train_loader, H_base, H_mu_diag, Xi, unlabeled_loader=unlabeled_loader)
+
+    assert len(trainer.history["train_loss"]) == 2
+    assert all(math.isfinite(v) for v in trainer.history["train_loss"])
+    assert set(trainer.history.as_dict()) >= {
+        "train_loss",
+        "train_e",
+        "train_psi",
+        "train_res",
+        "train_ph",
+    }
+    # The labelled batch is non-degenerate, so the data terms should
+    # actually engage rather than silently stay at zero.
+    assert any(v > 0.0 for v in trainer.history["train_e"])
+    assert any(v > 0.0 for v in trainer.history["train_psi"])
+
+
+def test_fit_with_unlabeled_loader_also_augments_validation(
+    semi_supervised_trainer_factory,
+    labeled_loader_factory,
+    unlabeled_loader_factory,
+    kitaev_operators,
+) -> None:
+    trainer, _ = semi_supervised_trainer_factory()
+    H_base, H_mu_diag, Xi = kitaev_operators
+    train_loader = labeled_loader_factory(total_samples=4, batch_size=4)
+    val_loader = labeled_loader_factory(total_samples=4, batch_size=4)
+    unlabeled_loader = unlabeled_loader_factory(total_samples=8, batch_size=4)
+
+    trainer.fit(
+        train_loader,
+        H_base,
+        H_mu_diag,
+        Xi,
+        val_loader=val_loader,
+        unlabeled_loader=unlabeled_loader,
+    )
+
+    assert len(trainer.history["val_loss"]) == 2
+    assert all(math.isfinite(v) for v in trainer.history["val_loss"])
+
+
+def test_fit_without_unlabeled_loader_keeps_pinned_fsm_loss_unaffected(
+    trainer_factory, tiny_loader_factory, kitaev_operators
+) -> None:
+    # Regression guard: PinnedFSMLoss does not declare energy_batch/psi_batch,
+    # so leaving unlabeled_loader at its default of None must keep working
+    # exactly as it did before SemiSupervisedLoss/unlabeled_loader existed.
+    trainer, _ = trainer_factory()
+    H_base, H_mu_diag, Xi = kitaev_operators
+    train_loader = tiny_loader_factory(n_samples=4, batch_size=4)
+
+    result = trainer.fit(train_loader, H_base, H_mu_diag, Xi)
+
+    assert isinstance(result, torch.nn.Module)
+    assert len(trainer.history["train_loss"]) == 3
+
+
+# ---------------------------------------------------------------------------
 # _run_epoch
 # ---------------------------------------------------------------------------
 
@@ -293,6 +438,54 @@ def test_train_step_dispatches_to_lbfgs_step_for_lbfgs(
 
 
 # ---------------------------------------------------------------------------
+# _call_loss
+# ---------------------------------------------------------------------------
+
+
+def test_call_loss_omits_labels_when_none(trainer_factory, kitaev_operators, mu_batch):
+    # PinnedFSMLoss's __call__ has no energy_batch/psi_batch parameters, so
+    # this only succeeds if _call_loss truly omits them rather than passing
+    # None through.
+    trainer, _ = trainer_factory()
+    H_base, H_mu_diag, Xi = kitaev_operators
+
+    loss, metrics = trainer._call_loss(mu_batch, H_base, H_mu_diag, Xi, epoch=1)
+
+    assert isinstance(loss, torch.Tensor)
+    assert isinstance(metrics, dict)
+
+
+def test_call_loss_forwards_labels_when_given(
+    semi_supervised_trainer_factory,
+    kitaev_operators,
+    labeled_loader_factory,
+    accelerator,
+):
+    trainer, _ = semi_supervised_trainer_factory()
+    H_base, H_mu_diag, Xi = kitaev_operators
+    mu_batch, energy_batch, psi_batch = next(
+        iter(labeled_loader_factory(total_samples=4, batch_size=4))
+    )
+    mu_batch = mu_batch.to(accelerator.device)
+    energy_batch = energy_batch.to(accelerator.device)
+    psi_batch = psi_batch.to(accelerator.device)
+
+    loss, metrics = trainer._call_loss(
+        mu_batch,
+        H_base,
+        H_mu_diag,
+        Xi,
+        epoch=1,
+        energy_batch=energy_batch,
+        psi_batch=psi_batch,
+    )
+
+    assert isinstance(loss, torch.Tensor)
+    assert metrics["e"] > 0.0
+    assert metrics["psi"] > 0.0
+
+
+# ---------------------------------------------------------------------------
 # _standard_step
 # ---------------------------------------------------------------------------
 
@@ -345,6 +538,21 @@ def test_lbfgs_step_returns_captured_loss_not_none(
     assert math.isfinite(loss_value)
     assert not math.isnan(loss_value)
     assert "pin_wt" in metrics
+
+
+# ---------------------------------------------------------------------------
+# _cycle
+# ---------------------------------------------------------------------------
+
+
+def test_cycle_re_iterates_past_the_loader_length(unlabeled_loader_factory):
+    loader = unlabeled_loader_factory(total_samples=4, batch_size=4)
+
+    cycle = UnifiedTrainer._cycle(loader)
+
+    first_pass = next(cycle)[0]
+    second_pass = next(cycle)[0]
+    assert first_pass.shape == second_pass.shape == (4, 1)
 
 
 # ---------------------------------------------------------------------------

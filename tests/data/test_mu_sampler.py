@@ -29,7 +29,31 @@ def test_invalid_regions():
     with pytest.raises(ValueError):
         MuSampler(regions=[])
     with pytest.raises(ValueError):
-        MuSampler(regions=[SamplingRegion(low=-3.0, high=3.0, weight=0.5)])
+        MuSampler(regions=[SamplingRegion(low=-3.0, high=3.0, weight=0.0)])
+    with pytest.raises(ValueError):
+        MuSampler(regions=[SamplingRegion(low=-3.0, high=3.0, weight=-1.0)])
+
+
+def test_weights_need_not_sum_to_one():
+    # A single region need not have weight 1.0: it always gets 100% of the
+    # batch regardless of its own weight's absolute value, since weights are
+    # relative to the scheme's total, not fractions of it.
+    sampler = MuSampler(regions=[SamplingRegion(low=-3.0, high=3.0, weight=0.5)])
+    counts = sampler._allocate_counts(10)
+    assert counts == [10]
+
+
+def test_relative_weights_allocate_proportionally():
+    # Weights (2, 6) are relative, so they allocate the same proportions
+    # (1:3) as (0.25, 0.75) would -- adding a new region's weight does not
+    # require rescaling any existing region's weight to compensate.
+    regions = [
+        SamplingRegion(low=-3.0, high=0.0, weight=2.0),
+        SamplingRegion(low=0.0, high=3.0, weight=6.0),
+    ]
+    sampler = MuSampler(regions=regions)
+    counts = sampler._allocate_counts(80)
+    assert counts == [20, 60]
 
 
 def test_allocate_counts(mu_sampler):
