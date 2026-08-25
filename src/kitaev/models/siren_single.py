@@ -49,9 +49,22 @@ class SirenPINN(nn.Module):
     network to represent high-frequency structure in the input-to-feature
     mapping.
 
-    The subsequent hidden layers use ``omega_0 = 2`` in this architecture.
-    The frequency parameter is therefore deliberately different from the
-    first layer and is treated as an architectural hyperparameter.
+    The subsequent hidden layers use ``omega_0 = hidden_omega_0``, a
+    constructor argument defaulting to ``1.0``. This is deliberately
+    different from the first layer's fixed ``30.0`` and, being an
+    ordinary argument rather than a hardcoded constant, can be swept in
+    an ablation study.
+
+    Input scaling
+    -------------
+    The standard SIREN initialisation (see :class:`SineLayer`) is
+    calibrated for roughly unit-scale inputs: the first layer's weights
+    are drawn from ``[-1/in_features, 1/in_features]``, which combined
+    with ``omega_0=30`` assumes the pre-activation ``Wx`` stays of
+    order 1. This project's ``mu`` domain is ``[-3, 3]`` rather than
+    ``[-1, 1]``, so ``x`` is divided by ``input_scale`` (default
+    ``3.0``) before it reaches the first SIREN layer, bringing it back
+    into the scale the initialisation expects.
 
     Eigenvector prediction head
     ----------------------------
@@ -97,14 +110,10 @@ class SirenPINN(nn.Module):
     The output head is an ordinary linear layer. Its weights are
     initialised using
 
-        bound = sqrt(6 / hidden_features) / omega_0,
+        bound = sqrt(6 / hidden_features) / hidden_omega_0,
 
-    with ``omega_0 = 2`` corresponding to the frequency used by the
-    hidden SIREN layers. Thus the implementation uses
-
-        bound = sqrt(6 / hidden_features) / 2.
-
-    This preserves the SIREN-style scaling associated with the hidden-layer
+    i.e. the same frequency used by the hidden SIREN layers. This
+    preserves the SIREN-style scaling associated with the hidden-layer
     frequency, while the head itself remains a linear prediction layer.
 
     Attributes:
@@ -122,6 +131,10 @@ class SirenPINN(nn.Module):
         hidden_features: Number of features produced by each SIREN layer.
         hidden_layers: Number of hidden SIREN layers following the first
             SIREN layer.
+        hidden_omega_0: Frequency parameter used by every hidden SIREN
+            layer.
+        input_scale: Divides the raw input before the first SIREN
+            layer; see "Input scaling" above.
     """
 
     def __init__(
@@ -131,6 +144,8 @@ class SirenPINN(nn.Module):
         in_features: int = 1,
         hidden_features: int = 32,
         hidden_layers: int = 2,
+        hidden_omega_0: float = 1.0,
+        input_scale: float = 3.0,
     ) -> None:
         """Initialise the single-head SIREN PINN.
 
@@ -140,6 +155,23 @@ class SirenPINN(nn.Module):
             hidden_features: Width of the shared SIREN representation.
             hidden_layers: Number of hidden SIREN layers following the
                 first layer.
+            hidden_omega_0: Frequency parameter used by every hidden
+                SIREN layer (the first layer always uses ``30.0``,
+                following the standard SIREN construction). Exposed as
+                a constructor argument, rather than hardcoded, so it
+                can be swept in an ablation study.
+            input_scale: Divides the raw input before it reaches the
+                first SIREN layer. The standard SIREN initialisation
+                (see :class:`SineLayer`) is calibrated for roughly
+                unit-scale inputs; without this rescaling, an input
+                domain of e.g. ``mu`` in ``[-3, 3]`` combined with the
+                first layer's ``omega_0=30`` drives the first sine
+                activation through dozens of oscillation cycles at
+                initialisation, well outside the regime the SIREN
+                scheme was designed for. The default of ``3.0`` matches
+                this project's standard ``mu`` sampling domain,
+                ``[-3, 3]``; override it if a different physical domain
+                is used.
         """
         super().__init__()
 
@@ -147,6 +179,8 @@ class SirenPINN(nn.Module):
         self.in_features = in_features
         self.hidden_features = hidden_features
         self.hidden_layers = hidden_layers
+        self.hidden_omega_0 = hidden_omega_0
+        self.input_scale = input_scale
 
         layers = [
             SineLayer(
@@ -163,7 +197,7 @@ class SirenPINN(nn.Module):
                     self.hidden_features,
                     self.hidden_features,
                     is_first=False,
-                    omega_0=1.0,
+                    omega_0=self.hidden_omega_0,
                 )
             )
 
@@ -173,8 +207,8 @@ class SirenPINN(nn.Module):
         self.psi_head = nn.Linear(self.hidden_features, self.n_sites)
 
         # Use the SIREN-style scaling associated with the hidden-layer
-        # frequency omega_0 = 2.0 for the linear prediction head.
-        bound = math.sqrt(6.0 / self.hidden_features) / 2.0
+        # frequency for the linear prediction head.
+        bound = math.sqrt(6.0 / self.hidden_features) / self.hidden_omega_0
 
         with torch.no_grad():
             self.psi_head.weight.uniform_(-bound, bound)
@@ -201,6 +235,11 @@ class SirenPINN(nn.Module):
         convention as a conventionally normalised eigenvector obtained
         from exact diagonalisation.
 
+        Before reaching the SIREN backbone, ``x`` is divided by
+        ``self.input_scale`` to bring it to the roughly unit scale the
+        SIREN initialisation is calibrated for (see ``input_scale`` in
+        :meth:`__init__`).
+
         Args:
             x: Input tensor containing the chemical potential values.
                 Expected shape is ``(batch_size, in_features)``.
@@ -209,7 +248,7 @@ class SirenPINN(nn.Module):
             L2-normalised predicted eigenvector with shape
             ``(batch_size, n_sites)``.
         """
-        features = self.net(x)
+        features = self.net(x / self.input_scale)
 
         psi_pred = self.psi_head(features)
 
