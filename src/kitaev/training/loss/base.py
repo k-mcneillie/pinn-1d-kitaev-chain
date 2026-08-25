@@ -14,6 +14,14 @@ class BaseLoss(ABC):
     for logging. This signature matches the existing loss classes
     (``PinnedFSMLoss``, ``ShiftInvertLoss``, etc.) unchanged, so they can
     be used with this trainer without modification.
+
+    A subclass that trains semi-supervised (e.g. ``SemiSupervisedLoss``)
+    may additionally declare two optional, keyword-only parameters,
+    ``energy_batch`` and ``psi_batch``, defaulting to ``None``.
+    ``UnifiedTrainer`` forwards a batch's exact labels through these two
+    keywords whenever its dataloader supplies them, and omits them
+    entirely otherwise — so a subclass that does not declare them (like
+    ``PinnedFSMLoss``) is never called with them and needs no changes.
     """
 
     @abstractmethod

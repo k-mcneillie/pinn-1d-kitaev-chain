@@ -26,7 +26,7 @@ class TestSirenPINN(TestCase):
         """Test psi_head weight initialization."""
         model = SirenPINN(n_sites=2)
         hidden_features = model.hidden_features
-        bound = np.sqrt(6.0 / hidden_features) / 2.0
+        bound = np.sqrt(6.0 / hidden_features) / model.hidden_omega_0
         with torch.no_grad():
             self.assertTrue(
                 torch.all(torch.abs(model.psi_head.weight) <= bound * 1.0001)
@@ -79,6 +79,33 @@ class TestSirenPINN(TestCase):
         self.assertIsNotNone(x.grad)
         assert x.grad is not None
         self.assertFalse(torch.isnan(x.grad).any())
+
+    def test_custom_hidden_omega_0_is_used_by_hidden_layers_and_head(self):
+        """hidden_omega_0 must be a real, swept-able constructor argument."""
+        model = SirenPINN(n_sites=2, hidden_omega_0=5.0)
+        self.assertEqual(model.net[0].omega_0, 30.0)  # first layer unaffected
+        self.assertEqual(model.net[1].omega_0, 5.0)
+        self.assertEqual(model.net[2].omega_0, 5.0)
+
+        bound = np.sqrt(6.0 / model.hidden_features) / 5.0
+        with torch.no_grad():
+            self.assertTrue(
+                torch.all(torch.abs(model.psi_head.weight) <= bound * 1.0001)
+            )
+
+    def test_input_scale_divides_input_before_backbone(self):
+        """The raw input must be divided by input_scale before the SIREN net."""
+        model = SirenPINN(n_sites=2, input_scale=5.0)
+        x = torch.tensor([[10.0], [-7.5]])
+
+        with torch.no_grad():
+            expected_features = model.net(x / 5.0)
+            expected_psi = torch.nn.functional.normalize(
+                model.psi_head(expected_features), p=2, dim=1, eps=1e-12
+            )
+
+        psi_pred = model(x)
+        self.assertTrue(torch.allclose(psi_pred, expected_psi))
 
 
 if __name__ == "__main__":

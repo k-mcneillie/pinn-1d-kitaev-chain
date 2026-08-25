@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -23,6 +22,15 @@ class MuSampler:
     supervised dataset below — the sampling strategy and the consumer of
     the samples are two separate concerns.
 
+    Weights are relative, not fractions that must sum to 1.0: each
+    region's share of a sampled batch is its own weight divided by the
+    sum of every region's weight in the scheme. This is what makes a
+    scheme composable — adding, removing, or reweighting one region
+    changes only that region's own share and everyone else's relative
+    *proportions* stay fixed; nothing has to be manually recomputed to
+    keep a fixed total, the way it would if weights had to sum to
+    exactly 1.0.
+
     Attributes:
         regions: The weighted intervals making up the sampling scheme.
         device: The torch device on which sampled tensors are created.
@@ -35,19 +43,24 @@ class MuSampler:
         """Initialises the sampler with a given region scheme.
 
         Args:
-            regions: Weighted intervals to sample from. Weights must sum
-                to 1.0 (within floating-point tolerance).
+            regions: Weighted intervals to sample from. Weights are
+                relative (see the class docstring) and need not sum to
+                any particular value, so long as their total is
+                positive.
 
         Raises:
-            ValueError: If the region weights do not sum to 1.0.
+            ValueError: If ``regions`` is empty, or if the total weight
+                across all regions is not strictly positive.
         """
         total_weight = sum(region.weight for region in regions)
-        if not np.isclose(total_weight, 1.0):
+        if not regions or total_weight <= 0:
             raise ValueError(
-                f"Region weights must sum to 1.0, got {total_weight!r} "
-                f"from {len(regions)} region(s)."
+                "At least one region with a positive total weight is "
+                f"required, got {len(regions)} region(s) with total "
+                f"weight {total_weight!r}."
             )
         self.regions = tuple(regions)
+        self._total_weight = total_weight
 
     def sample(self, batch_size: int) -> Tensor:
         """Draws a shuffled batch of mu values from the configured mixture.
@@ -85,7 +98,10 @@ class MuSampler:
             A list of integer counts, one per region, summing exactly
             to ``batch_size``.
         """
-        counts = [int(batch_size * region.weight) for region in self.regions]
+        counts = [
+            int(batch_size * region.weight / self._total_weight)
+            for region in self.regions
+        ]
         counts[-1] += batch_size - sum(counts)
         return counts
 

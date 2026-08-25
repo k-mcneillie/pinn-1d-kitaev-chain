@@ -17,8 +17,13 @@ class SamplingRegion:
     Attributes:
         low: Lower bound of the interval (inclusive).
         high: Upper bound of the interval (exclusive).
-        weight: Fraction of a batch drawn from this interval. The
-            weights across all regions in a scheme must sum to 1.0.
+        weight: Relative weight of this interval within its scheme.
+            A region's actual share of a sampled batch is its weight
+            divided by the sum of every region's weight in the same
+            :class:`~kitaev.data.mu_sampler.MuSampler` — weights need
+            not sum to 1.0 (or any other particular value), which is
+            what lets a scheme be extended by adding a region without
+            having to rebalance every other region's weight by hand.
     """
 
     low: float
