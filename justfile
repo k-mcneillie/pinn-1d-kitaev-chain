@@ -56,3 +56,6 @@ git-clean-merged:
 git-prune:
     git fetch --prune
 
+git-rebase:
+    git fetch origin/main
+    git rebase origin/main
