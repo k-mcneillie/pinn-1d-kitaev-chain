@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import torch
@@ -33,6 +34,14 @@ class UnifiedTrainer:
     ``accelerator.prepare`` in the constructor; dataloaders are prepared
     lazily inside :meth:`fit`, since they are not always known at
     construction time.
+
+    This is the single training entrypoint for the project regardless of
+    whether ``loss_fn`` is purely label-free (``PinnedFSMLoss``, trained
+    from ``train_loader`` alone) or semi-supervised (``SemiSupervisedLoss``,
+    trained from a small labelled ``train_loader`` plus a much larger
+    ``unlabeled_loader`` passed to :meth:`fit`) — swapping between the two
+    is a choice of ``loss_fn`` and dataloaders, not a different training
+    loop, which is what keeps ablations across losses comparable.
 
     Attributes:
         accelerator: The shared ``Accelerator`` instance handling device
@@ -101,14 +110,21 @@ class UnifiedTrainer:
         H_mu_diag: torch.Tensor,
         Xi: torch.Tensor,
         val_loader: DataLoader | None = None,
+        unlabeled_loader: DataLoader | None = None,
     ) -> nn.Module:
         """Runs the full training loop and returns the best (or final) model.
 
         Args:
             train_loader: Yields batches whose first element is a
-                ``mu`` tensor. Prepared internally via
-                ``accelerator.prepare``, so it should not be
-                pre-prepared by the caller.
+                ``mu`` tensor. A batch may optionally carry exact
+                labels as its second and third elements, ``energy``
+                and ``psi`` (as produced by, e.g.,
+                ``SupervisedKitaevDataset.dataloader``) — when present,
+                these are forwarded to ``loss_fn`` as the
+                ``energy_batch``/``psi_batch`` keyword arguments, for
+                losses that declare them (e.g. ``SemiSupervisedLoss``).
+                Prepared internally via ``accelerator.prepare``, so it
+                should not be pre-prepared by the caller.
             H_base: Mu-independent part of the batched Hamiltonian.
                 Should already be on ``self.accelerator.device``.
             H_mu_diag: Diagonal matrix such that
@@ -121,6 +137,19 @@ class UnifiedTrainer:
                 convention as ``train_loader``. When given, enables
                 checkpointing of the best model and (if configured)
                 early stopping.
+            unlabeled_loader: Optional dataloader of label-free
+                ``mu`` batches (e.g. from
+                ``UnsupervisedMuGenerator.dataloader``), for
+                semi-supervised training. When given, each step draws
+                one batch from it, cycling once exhausted, and
+                concatenates its ``mu`` values onto ``train_loader``'s
+                (and, separately, ``val_loader``'s) ``mu`` batch before
+                calling ``loss_fn`` — letting a single loss combine a
+                small labelled batch with a much larger label-free one,
+                as ``SemiSupervisedLoss`` does. Has no effect on a
+                ``train_loader``/``val_loader`` batch that carries no
+                labels of its own beyond widening the physics-only
+                batch.
 
         Returns:
             The trained model, unwrapped from any accelerate wrapping.
@@ -136,10 +165,27 @@ class UnifiedTrainer:
         train_loader = self.accelerator.prepare(train_loader)
         if val_loader is not None:
             val_loader = self.accelerator.prepare(val_loader)
+        if unlabeled_loader is not None:
+            unlabeled_loader = self.accelerator.prepare(unlabeled_loader)
+
+        # Independent cycles so draining one during training doesn't
+        # advance the other's position through val_loader's epochs.
+        train_unlabeled_cycle = (
+            self._cycle(unlabeled_loader) if unlabeled_loader is not None else None
+        )
+        val_unlabeled_cycle = (
+            self._cycle(unlabeled_loader) if unlabeled_loader is not None else None
+        )
 
         for epoch in range(1, self.config.epochs + 1):
             train_metrics = self._run_epoch(
-                train_loader, H_base, H_mu_diag, Xi, train=True, epoch=epoch
+                train_loader,
+                H_base,
+                H_mu_diag,
+                Xi,
+                train=True,
+                epoch=epoch,
+                unlabeled_cycle=train_unlabeled_cycle,
             )
             self._record("train", train_metrics)
 
@@ -150,7 +196,13 @@ class UnifiedTrainer:
             should_stop = False
             if val_loader is not None:
                 val_metrics = self._run_epoch(
-                    val_loader, H_base, H_mu_diag, Xi, train=False, epoch=epoch
+                    val_loader,
+                    H_base,
+                    H_mu_diag,
+                    Xi,
+                    train=False,
+                    epoch=epoch,
+                    unlabeled_cycle=val_unlabeled_cycle,
                 )
                 self._record("val", val_metrics)
                 unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -180,11 +232,16 @@ class UnifiedTrainer:
         *,
         train: bool,
         epoch: int,
+        unlabeled_cycle: Iterator[tuple[torch.Tensor, ...]] | None = None,
     ) -> dict[str, float]:
         """Runs one full pass over ``data_loader``, either training or evaluating.
 
         Args:
-            data_loader: Prepared dataloader to iterate over.
+            data_loader: Prepared dataloader to iterate over. Each
+                batch's first element is treated as ``mu``; a second
+                and third element, if present, are treated as exact
+                ``(energy, psi)`` labels for that batch and forwarded
+                to ``loss_fn``.
             H_base: See :meth:`fit`.
             H_mu_diag: See :meth:`fit`.
             Xi: See :meth:`fit`.
@@ -192,6 +249,10 @@ class UnifiedTrainer:
                 in train mode; if ``False``, runs under
                 ``torch.no_grad()`` in eval mode.
             epoch: Current epoch number.
+            unlabeled_cycle: Optional never-ending iterator over a
+                label-free dataloader (see :meth:`fit`). One batch is
+                drawn per step and its ``mu`` values are concatenated
+                onto ``data_loader``'s own ``mu`` batch.
 
         Returns:
             Averaged metrics for the epoch, including a ``"loss"`` key.
@@ -201,19 +262,65 @@ class UnifiedTrainer:
 
         with torch.enable_grad() if train else torch.no_grad():
             for batch in data_loader:
-                mu_batch = batch[0]  # already on the correct device via accelerate
+                # Already on the correct device via accelerate.
+                mu_batch = batch[0]
+                energy_batch = batch[1] if len(batch) > 1 else None
+                psi_batch = batch[2] if len(batch) > 2 else None
+
+                if unlabeled_cycle is not None:
+                    unlabeled_mu = next(unlabeled_cycle)[0]
+                    mu_batch = torch.cat([mu_batch, unlabeled_mu], dim=0)
+
                 if train:
                     loss_value, metrics = self._train_step(
-                        mu_batch, H_base, H_mu_diag, Xi, epoch=epoch
+                        mu_batch,
+                        H_base,
+                        H_mu_diag,
+                        Xi,
+                        epoch=epoch,
+                        energy_batch=energy_batch,
+                        psi_batch=psi_batch,
                     )
                 else:
-                    loss, metrics = self.loss_fn(
-                        self.model, mu_batch, H_base, H_mu_diag, Xi, epoch=epoch
+                    loss, metrics = self._call_loss(
+                        mu_batch,
+                        H_base,
+                        H_mu_diag,
+                        Xi,
+                        epoch,
+                        energy_batch=energy_batch,
+                        psi_batch=psi_batch,
                     )
                     loss_value = loss.item()
                 accumulator.update({**metrics, "loss": loss_value})
 
         return accumulator.averages()
+
+    def _call_loss(
+        self,
+        mu_batch: torch.Tensor,
+        H_base: torch.Tensor,
+        H_mu_diag: torch.Tensor,
+        Xi: torch.Tensor,
+        epoch: int,
+        energy_batch: torch.Tensor | None = None,
+        psi_batch: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Invokes ``loss_fn``, forwarding labels only when they are present.
+
+        ``energy_batch``/``psi_batch`` are omitted from the call
+        entirely when ``None``, rather than passed as ``None``, so that
+        losses which (like ``PinnedFSMLoss``) do not declare these
+        keyword arguments at all keep working unmodified.
+        """
+        extra_kwargs: dict[str, torch.Tensor] = {}
+        if energy_batch is not None:
+            extra_kwargs["energy_batch"] = energy_batch
+        if psi_batch is not None:
+            extra_kwargs["psi_batch"] = psi_batch
+        return self.loss_fn(
+            self.model, mu_batch, H_base, H_mu_diag, Xi, epoch=epoch, **extra_kwargs
+        )
 
     def _train_step(
         self,
@@ -222,6 +329,8 @@ class UnifiedTrainer:
         H_mu_diag: torch.Tensor,
         Xi: torch.Tensor,
         epoch: int,
+        energy_batch: torch.Tensor | None = None,
+        psi_batch: torch.Tensor | None = None,
     ) -> tuple[float, dict[str, float]]:
         """Dispatches a single optimisation step to the correct routine.
 
@@ -238,13 +347,34 @@ class UnifiedTrainer:
             H_mu_diag: See :meth:`fit`.
             Xi: See :meth:`fit`.
             epoch: Current epoch number.
+            energy_batch: Optional exact energies for (a leading subset
+                of) ``mu_batch``, forwarded to ``loss_fn`` when given.
+            psi_batch: Optional exact eigenvectors for (a leading
+                subset of) ``mu_batch``, forwarded to ``loss_fn`` when
+                given.
 
         Returns:
             Tuple of ``(loss_value, metrics)`` for this batch.
         """
         if self._is_lbfgs:
-            return self._lbfgs_step(mu_batch, H_base, H_mu_diag, Xi, epoch=epoch)
-        return self._standard_step(mu_batch, H_base, H_mu_diag, Xi, epoch=epoch)
+            return self._lbfgs_step(
+                mu_batch,
+                H_base,
+                H_mu_diag,
+                Xi,
+                epoch=epoch,
+                energy_batch=energy_batch,
+                psi_batch=psi_batch,
+            )
+        return self._standard_step(
+            mu_batch,
+            H_base,
+            H_mu_diag,
+            Xi,
+            epoch=epoch,
+            energy_batch=energy_batch,
+            psi_batch=psi_batch,
+        )
 
     def _standard_step(
         self,
@@ -253,11 +383,19 @@ class UnifiedTrainer:
         H_mu_diag: torch.Tensor,
         Xi: torch.Tensor,
         epoch: int,
+        energy_batch: torch.Tensor | None = None,
+        psi_batch: torch.Tensor | None = None,
     ) -> tuple[float, dict[str, float]]:
         """Runs a single zero-grad/backward/step optimisation step."""
         self.optimiser.zero_grad()
-        loss, metrics = self.loss_fn(
-            self.model, mu_batch, H_base, H_mu_diag, Xi, epoch=epoch
+        loss, metrics = self._call_loss(
+            mu_batch,
+            H_base,
+            H_mu_diag,
+            Xi,
+            epoch,
+            energy_batch=energy_batch,
+            psi_batch=psi_batch,
         )
         self.accelerator.backward(loss)
         if self.config.grad_clip_norm is not None:
@@ -274,6 +412,8 @@ class UnifiedTrainer:
         H_mu_diag: torch.Tensor,
         Xi: torch.Tensor,
         epoch: int,
+        energy_batch: torch.Tensor | None = None,
+        psi_batch: torch.Tensor | None = None,
     ) -> tuple[float, dict[str, float]]:
         """Runs a single L-BFGS step via its closure-based interface.
 
@@ -282,6 +422,9 @@ class UnifiedTrainer:
         may invoke the closure multiple times internally, and
         accelerate's ``AcceleratedOptimizer.step`` discards the
         closure's return value rather than passing it back.
+        ``energy_batch``/``psi_batch`` are drawn once, outside the
+        closure, so every internal re-evaluation of the closure sees
+        the same labels rather than a freshly cycled batch.
         """
         captured_metrics: dict[str, float] = {}
         captured_loss = float("nan")
@@ -289,8 +432,14 @@ class UnifiedTrainer:
         def closure() -> torch.Tensor:
             nonlocal captured_loss
             self.optimiser.zero_grad()
-            closure_loss, closure_metrics = self.loss_fn(
-                self.model, mu_batch, H_base, H_mu_diag, Xi, epoch=epoch
+            closure_loss, closure_metrics = self._call_loss(
+                mu_batch,
+                H_base,
+                H_mu_diag,
+                Xi,
+                epoch,
+                energy_batch=energy_batch,
+                psi_batch=psi_batch,
             )
             self.accelerator.backward(closure_loss)
             captured_loss = closure_loss.item()
@@ -300,6 +449,20 @@ class UnifiedTrainer:
 
         self.optimiser.step(closure)
         return captured_loss, captured_metrics
+
+    @staticmethod
+    def _cycle(
+        loader: DataLoader,
+    ) -> Iterator[tuple[torch.Tensor, ...]]:
+        """Yields batches from ``loader`` forever, re-iterating (and thus
+        re-shuffling, if configured) once each pass is exhausted.
+
+        Used instead of ``itertools.cycle`` so batches are not cached in
+        memory to be replayed; each pass is a fresh call to
+        ``iter(loader)``.
+        """
+        while True:
+            yield from loader
 
     def _record(self, split: str, metrics: dict[str, float]) -> None:
         """Appends a split's averaged metrics into the training history.
@@ -318,20 +481,37 @@ class UnifiedTrainer:
         train_metrics: dict[str, float],
         val_metrics: dict[str, float] | None,
     ) -> None:
-        """Logs a single formatted progress line for the given epoch."""
+        """Logs a single formatted progress line for the given epoch.
+
+        Metrics whose key ends in ``_wt`` (e.g. ``pin_wt``, ``physics_wt``)
+        are annealing-schedule weights rather than loss components: they
+        are pulled out of the main ``.6f``-formatted list and appended at
+        the end at 3 decimal places instead, so any :class:`BaseLoss`
+        subclass that reports one gets consistent log formatting without
+        this method needing to know its specific name.
+        """
+
+        def is_weight_key(key: str) -> bool:
+            return key.endswith("_wt")
+
         train_parts = [
-            f"{k}: {v:.6f}" for k, v in train_metrics.items() if k != "pin_wt"
+            f"{k}: {v:.6f}" for k, v in train_metrics.items() if not is_weight_key(k)
         ]
         message = f"Epoch {epoch:04d} | " + " | ".join(train_parts)
 
         if val_metrics is not None:
             val_parts = [
-                f"val_{k}: {v:.6f}" for k, v in val_metrics.items() if k != "pin_wt"
+                f"val_{k}: {v:.6f}"
+                for k, v in val_metrics.items()
+                if not is_weight_key(k)
             ]
             message += " || " + " | ".join(val_parts)
 
-        if "pin_wt" in train_metrics:
-            message += f" | pin_wt: {train_metrics['pin_wt']:.3f}"
+        weight_parts = [
+            f"{k}: {v:.3f}" for k, v in train_metrics.items() if is_weight_key(k)
+        ]
+        if weight_parts:
+            message += " | " + " | ".join(weight_parts)
 
         self.session.info(message)
 
