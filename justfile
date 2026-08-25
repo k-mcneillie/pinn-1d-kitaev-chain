@@ -49,3 +49,10 @@ latex-clean:
         rm -f docs/write_up/texput.pdf; \
         rm -f main.log; \
     fi
+
+git-clean-merged:
+    git branch --merged | grep -v "\*" | xargs git branch -d
+
+git-prune:
+    git fetch --prune
+
