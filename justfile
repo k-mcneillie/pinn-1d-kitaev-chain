@@ -28,3 +28,24 @@ type-check:
 # Clean up temporary cache directories and build artifacts
 clean:
     rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov dist build src/*.egg-info
+
+latex-build:
+    @if [ "$$(basename $$(pwd))" = "write_up" ]; then \
+        pdflatex main.tex && \
+        bibtex main && \
+        pdflatex main.tex && \
+        pdflatex main.tex; \
+    else \
+        (cd docs/write_up && pdflatex main.tex && bibtex main && pdflatex main.tex && pdflatex main.tex); \
+    fi
+    just latex-clean
+
+latex-clean:
+    @if [ "$$(basename $$(pwd))" = "write_up" ]; then \
+        rm -f *.{aux,log,bbl,blg,out,toc,bib,fls,fdb_latexmk}; \
+        rm -f texput.pdf; \
+    else \
+        rm -f docs/write_up/*.{aux,log,bbl,blg,out,toc,bib,fls,fdb_latexmk}; \
+        rm -f docs/write_up/texput.pdf; \
+        rm -f main.log; \
+    fi
