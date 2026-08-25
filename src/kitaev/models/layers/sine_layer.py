@@ -71,6 +71,7 @@ class SineLayer(nn.Module):
         self,
         in_features: int,
         out_features: int,
+        *,
         bias: bool = True,
         is_first: bool = False,
         omega_0: float = 30.0,
@@ -94,7 +95,9 @@ class SineLayer(nn.Module):
         self.omega_0 = omega_0
         self.is_first = is_first
         self.in_features = in_features
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.out_features = out_features
+        self.bias = bias
+        self.linear = nn.Linear(self.in_features, self.out_features, bias=self.bias)
         self.init_weights()
 
     def init_weights(self) -> None:
