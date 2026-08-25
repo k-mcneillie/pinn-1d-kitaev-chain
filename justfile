@@ -27,7 +27,7 @@ type-check:
 
 # Clean up temporary cache directories and build artifacts
 clean:
-    rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov dist build src/*.egg-info
+    rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov dist build src/*.egg-info coverage.xml
 
 latex-build:
     @if [ "$$(basename $$(pwd))" = "write_up" ]; then \
@@ -49,3 +49,10 @@ latex-clean:
         rm -f docs/write_up/texput.pdf; \
         rm -f main.log; \
     fi
+
+git-clean-merged:
+    git branch --merged | grep -v "\*" | xargs git branch -d
+
+git-prune:
+    git fetch --prune
+
