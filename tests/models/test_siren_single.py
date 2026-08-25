@@ -65,19 +65,20 @@ class TestSirenPINN(TestCase):
         self.assertEqual(model.psi_head.out_features, 3)
 
     def test_differentiability(self):
-        """Test output differentiability."""
-        model = SirenPINN(n_sites=2)
-        x = torch.randn(1, 1, requires_grad=True)
+            """Test output differentiability."""
+            model = SirenPINN(n_sites=2)
+            x = torch.randn(1, 1, requires_grad=True)
 
-        output = model(x)
+            output = model(x)
 
-        self.assertTrue(output.requires_grad)
+            self.assertTrue(output.requires_grad)
 
-        x.grad = None
-        output.sum().backward()
+            x.grad = None
+            output.sum().backward()
 
-        self.assertIsNotNone(x.grad)
-        self.assertFalse(torch.isnan(x.grad).any())
+            self.assertIsNotNone(x.grad)
+            assert x.grad is not None
+            self.assertFalse(torch.isnan(x.grad).any())
 
 
 if __name__ == "__main__":
