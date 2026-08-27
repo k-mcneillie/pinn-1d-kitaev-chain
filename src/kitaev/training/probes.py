@@ -189,7 +189,10 @@ class BdGEvaluationProbe(TrainingCallback):
         psi_unit = psi_pred / np.clip(psi_norm, 1e-12, None)[:, None]
 
         abs_err = np.abs(e_pred - self._e_exact)
-        topological = self.mu_grid < self._transition
+        # The transition sits at |mu| = 2t, so the phase split is on the
+        # magnitude: this stays correct for a two-sided grid (e.g. the
+        # dual-head model's [-3, 3] domain), where mu < -2t is trivial too.
+        topological = np.abs(self.mu_grid) < self._transition
         trivial = ~topological
 
         n_sites = self.n_sites

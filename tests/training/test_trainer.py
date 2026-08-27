@@ -38,6 +38,7 @@ def trainer_factory(accelerator, tiny_model_factory, make_session):
         loss_fn=None,
         n_sites: int = 2,
         hidden_features: int = 4,
+        start_epoch: int = 1,
     ) -> tuple[UnifiedTrainer, object]:
         model = tiny_model_factory(n_sites=n_sites, hidden_features=hidden_features)
 
@@ -68,6 +69,7 @@ def trainer_factory(accelerator, tiny_model_factory, make_session):
             optimiser=optimiser,
             scheduler=scheduler,
             config=config,
+            start_epoch=start_epoch,
         )
         return trainer, session
 
@@ -267,6 +269,28 @@ def test_fit_logs_on_period_and_on_final_epoch(
     # final-epoch fallback at 5 (which is not itself a multiple of 2) — three
     # logged epochs in total, covering both sides of the `or`.
     assert log_text.count("Epoch 000") == 3
+
+
+def test_fit_start_epoch_offsets_the_loop_and_final_epoch_log(
+    trainer_factory, tiny_loader_factory, kitaev_operators
+) -> None:
+    # start_epoch shifts the epoch counter the loop, the callbacks, and the
+    # final-epoch log line all see; the number of epochs run is unchanged.
+    trainer, session = trainer_factory(
+        config=TrainerConfig(epochs=3, print_freq=1000, patience=None),
+        start_epoch=10,
+    )
+    H_base, H_mu_diag, Xi = kitaev_operators
+    train_loader = tiny_loader_factory(n_samples=4, batch_size=4)
+
+    trainer.fit(train_loader, H_base, H_mu_diag, Xi, val_loader=None)
+
+    assert len(trainer.history["train_loss"]) == 3
+    # print_freq=1000 never hits, so only the final-epoch fallback logs, and
+    # it logs epoch 12 (= 10 + 3 - 1), not epoch 3.
+    log_text = _read_log(session)
+    assert "Epoch 0012" in log_text
+    assert "Epoch 0003" not in log_text
 
 
 def test_fit_early_stopping_triggers_and_breaks(
