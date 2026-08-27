@@ -25,9 +25,14 @@ format:
 type-check:
     mypy src/
 
-# Clean up temporary cache directories and build artifacts
+# Clean up temporary cache directories and build artifacts, including
+# __pycache__/.ipynb_checkpoints/*.pyc nested anywhere in the repo, not
+# just the top level
 clean:
     rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage htmlcov dist build src/*.egg-info coverage.xml
+    find . -name .git -prune -o -type d -name "__pycache__" -exec rm -rf {} +
+    find . -name .git -prune -o -type d -name ".ipynb_checkpoints" -exec rm -rf {} +
+    find . -name .git -prune -o -type f -name "*.py[co]" -exec rm -f {} +
 
 latex-build:
     @if [ "$$(basename $$(pwd))" = "write_up" ]; then \
@@ -49,13 +54,3 @@ latex-clean:
         rm -f docs/write_up/texput.pdf; \
         rm -f main.log; \
     fi
-
-git-clean-merged:
-    git branch --merged | grep -v "\*" | xargs git branch -d
-
-git-prune:
-    git fetch --prune
-
-git-rebase:
-    git fetch origin/main
-    git rebase origin/main
