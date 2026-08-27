@@ -1,4 +1,4 @@
-"""Tests for the ChiralEvaluationProbe physical-error callback."""
+"""Tests for the BdGEvaluationProbe physical-error callback."""
 
 from __future__ import annotations
 
@@ -8,9 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-from kitaev.analytical import KitaevChainHamiltonian, chiral_block
-from kitaev.models import SirenPINNChiral
-from kitaev.training.probes import ChiralEvaluationProbe
+from kitaev.analytical import (
+    KitaevChainHamiltonian,
+    chiral_block,
+    reconstruct_bdg_eigenvector,
+)
+from kitaev.models import ChiralToBdGAdapter, SirenPINNChiral
+from kitaev.training.probes import BdGEvaluationProbe
 from kitaev.training.utils import TrainingHistory
 
 N_SITES = 8
@@ -25,11 +29,16 @@ PROBE_KEYS = {
     "probe_edge_mae",
     "probe_subspace_infidelity",
     "probe_subspace_infidelity_max",
+    "probe_psi_norm",
 }
 
 
+def _chiral_adapter(model: torch.nn.Module) -> ChiralToBdGAdapter:
+    return ChiralToBdGAdapter(model, hopping=HOPPING, pairing=PAIRING)
+
+
 class _ExactChiralModel(torch.nn.Module):
-    """Returns the exact smallest singular pair of h(mu); a perfect model."""
+    """Returns the exact smallest singular pair ``(u, v)`` of ``h(mu)``."""
 
     def __init__(self, n_sites: int, hopping: float, pairing: float) -> None:
         super().__init__()
@@ -51,6 +60,36 @@ class _ExactChiralModel(torch.nn.Module):
         return u, v
 
 
+class _ExactEPsiModel(torch.nn.Module):
+    """A perfect dual-head-style model: returns ``(E, psi)`` directly."""
+
+    def __init__(
+        self, n_sites: int, hopping: float, pairing: float, *, scale: float = 1.0
+    ) -> None:
+        super().__init__()
+        self.n_sites = n_sites
+        self._hopping = hopping
+        self._pairing = pairing
+        self._scale = scale
+        self.register_parameter("_dummy", torch.nn.Parameter(torch.zeros(1)))
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        energies, states = [], []
+        for mu in x.reshape(-1).tolist():
+            h = chiral_block(mu, self.n_sites, self._hopping, self._pairing)
+            left, singular, right_t = np.linalg.svd(h)
+            k = int(np.argmin(singular))
+            energies.append(singular[k])
+            states.append(
+                reconstruct_bdg_eigenvector(left[:, k], right_t[k, :], sign=1)
+            )
+        e = torch.tensor(np.array(energies), dtype=x.dtype, device=x.device)
+        psi = self._scale * torch.tensor(
+            np.array(states), dtype=x.dtype, device=x.device
+        )
+        return e.unsqueeze(-1), psi
+
+
 class _RecordingSession:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -59,7 +98,7 @@ class _RecordingSession:
         self.messages.append(message)
 
 
-def _probe(**overrides) -> ChiralEvaluationProbe:
+def _probe(**overrides) -> BdGEvaluationProbe:
     kwargs = {
         "n_sites": N_SITES,
         "hopping": HOPPING,
@@ -68,11 +107,16 @@ def _probe(**overrides) -> ChiralEvaluationProbe:
         "every": 3,
     }
     kwargs.update(overrides)
-    return ChiralEvaluationProbe(**kwargs)
+    return BdGEvaluationProbe(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Construction
+# ---------------------------------------------------------------------------
 
 
 def test_probe_default_grid_spans_the_valid_half_domain() -> None:
-    probe = ChiralEvaluationProbe(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+    probe = BdGEvaluationProbe(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
     assert probe.mu_grid.shape == (200,)
     assert probe.mu_grid[0] == pytest.approx(0.05)
     assert probe.mu_grid[-1] == pytest.approx(4.0 * HOPPING)
@@ -90,8 +134,13 @@ def test_probe_caches_exact_references_at_construction() -> None:
     assert probe._e_exact[10] == pytest.approx(expected_e)
 
 
+# ---------------------------------------------------------------------------
+# Firing schedule
+# ---------------------------------------------------------------------------
+
+
 def test_probe_fires_on_first_epoch_then_every_interval() -> None:
-    probe = _probe(every=3)
+    probe = _probe(every=3, adapt=_chiral_adapter)
     model = SirenPINNChiral(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
     history = TrainingHistory()
 
@@ -103,7 +152,7 @@ def test_probe_fires_on_first_epoch_then_every_interval() -> None:
 
 
 def test_probe_records_every_metric_key_each_evaluation() -> None:
-    probe = _probe(every=1)
+    probe = _probe(every=1, adapt=_chiral_adapter)
     model = SirenPINNChiral(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
     history = TrainingHistory()
 
@@ -115,10 +164,13 @@ def test_probe_records_every_metric_key_each_evaluation() -> None:
         assert len(history[key]) == 2
 
 
-def test_probe_errors_are_tiny_for_an_exact_model_in_the_trivial_phase() -> None:
-    # Trivial-phase grid only: the smallest singular triple is non-degenerate,
-    # so a perfect model reproduces the exact eigenpair up to a sign.
-    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1)
+# ---------------------------------------------------------------------------
+# Model-agnostic evaluation
+# ---------------------------------------------------------------------------
+
+
+def test_probe_scores_a_chiral_model_through_the_adapter() -> None:
+    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1, adapt=_chiral_adapter)
     model = _ExactChiralModel(N_SITES, HOPPING, PAIRING)
     history = TrainingHistory()
 
@@ -127,12 +179,43 @@ def test_probe_errors_are_tiny_for_an_exact_model_in_the_trivial_phase() -> None
     assert history["probe_e_mae"][-1] == pytest.approx(0.0, abs=1e-5)
     assert history["probe_edge_mae"][-1] == pytest.approx(0.0, abs=1e-5)
     assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-5)
-    assert history["probe_subspace_infidelity_max"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_psi_norm"][-1] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_probe_scores_a_direct_e_psi_model_without_an_adapter() -> None:
+    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1)  # adapt=None
+    model = _ExactEPsiModel(N_SITES, HOPPING, PAIRING)
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    assert history["probe_e_mae"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_edge_mae"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_probe_normalises_psi_but_reports_the_raw_norm() -> None:
+    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 12), every=1)
+    model = _ExactEPsiModel(N_SITES, HOPPING, PAIRING, scale=2.0)
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    # Raw norm is 2, but the density / subspace metrics use the normalised
+    # direction and are still essentially exact.
+    assert history["probe_psi_norm"][-1] == pytest.approx(2.0, abs=1e-5)
+    assert history["probe_edge_mae"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Side effects
+# ---------------------------------------------------------------------------
 
 
 def test_probe_writes_to_session_when_supplied() -> None:
     session = _RecordingSession()
-    probe = _probe(every=1, session=session)
+    probe = _probe(every=1, session=session, adapt=_chiral_adapter)
     model = SirenPINNChiral(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
 
     probe.on_epoch_end(1, model, TrainingHistory())
@@ -143,7 +226,9 @@ def test_probe_writes_to_session_when_supplied() -> None:
 
 
 def test_probe_restores_the_models_training_flag() -> None:
-    probe = _probe(every=1)
+    # adapt wraps the model in a fresh module whose .eval() also touches the
+    # shared submodule; the probe must restore the raw model's flag.
+    probe = _probe(every=1, adapt=_chiral_adapter)
     model = SirenPINNChiral(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
 
     model.train()
@@ -156,7 +241,7 @@ def test_probe_restores_the_models_training_flag() -> None:
 
 
 def test_probe_reports_nan_when_a_phase_has_no_grid_points() -> None:
-    probe = _probe(mu_grid=np.linspace(2.5, 4.0, 20), every=1)
+    probe = _probe(mu_grid=np.linspace(2.5, 4.0, 20), every=1, adapt=_chiral_adapter)
     model = SirenPINNChiral(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
     history = TrainingHistory()
 

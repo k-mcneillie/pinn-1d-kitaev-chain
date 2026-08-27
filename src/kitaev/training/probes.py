@@ -1,12 +1,13 @@
 # src/kitaev/training/probes.py
-"""Physical-error probe for the chiral PINN, hooked into the epoch loop.
+"""Physical-error probe for BdG spectral PINNs, hooked into the epoch loop.
 
-After a few hundred epochs the training loss of
-:class:`kitaev.training.loss.ChiralFSMLoss` is numerically dominated by the
-folded-spectrum floor ``<lambda_1(mu)^2>``. That floor is a property of the
-exact spectrum -- it is nonzero because the trivial-phase gap is of order
-``t`` -- and its flatness is convergence, not stagnation. To make that
-visible, :class:`ChiralEvaluationProbe` compares the model against exact
+The label-free training losses in this project (e.g.
+:class:`kitaev.training.loss.ChiralFSMLoss`) are, after a few hundred
+epochs, numerically dominated by a folded-spectrum floor
+``<lambda_1(mu)^2>``. That floor is a property of the exact spectrum -- it
+is nonzero because the trivial-phase gap is of order ``t`` -- and its
+flatness is convergence, not stagnation. To make that visible,
+:class:`BdGEvaluationProbe` compares the model against exact
 diagonalisation on a fixed ``mu`` grid every few epochs and records
 interpretable errors into the run's :class:`TrainingHistory`:
 
@@ -17,10 +18,16 @@ interpretable errors into the run's :class:`TrainingHistory`:
 - ``probe_subspace_infidelity`` (mean and max): ``1 - ||P psi_pred||``,
   where ``P`` projects onto the span of the two exact eigenvectors of
   smallest ``|E|``. This is the well-defined eigenvector-accuracy measure
-  even where the ``+-lambda_1`` pair is degenerate (the topological phase).
+  even where the ``+-lambda_1`` pair is degenerate (the topological phase);
+- ``probe_psi_norm``: mean Euclidean norm of ``psi_pred`` (should be ~1),
+  a sanity check when comparing architectures.
 
-All three fall steadily while the loss is flat, which is the evidence that
-training is still improving the physical solution.
+The probe is model-agnostic: it expects a callable returning
+``(E_pred, psi_pred)`` with ``psi_pred`` a ``2N`` Nambu-basis vector. A
+dual-head model satisfies this directly; a model that returns something
+else (e.g. the chiral ``(u, v)`` pair) is bridged with the ``adapt``
+argument. Every architecture in the project can therefore be scored on the
+same grid with the same metrics.
 
 The exact references are computed once, at construction, in a single
 diagonalisation sweep; each probe call is then only a forward pass.
@@ -28,14 +35,14 @@ diagonalisation sweep; each probe call is then only a forward pass.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 import torch
 
 from kitaev.analytical import KitaevChainHamiltonian
-from kitaev.models.siren_chiral import ChiralToBdGAdapter, SirenPINNChiral
 
 from .callbacks import TrainingCallback
 from .utils import TrainingHistory
@@ -43,8 +50,12 @@ from .utils import TrainingHistory
 if TYPE_CHECKING:
     from sesh import Session
 
+#: A callable turning the model under training into one whose ``forward``
+#: returns ``(E_pred, psi_pred)``.
+ModelAdapter = Callable[[torch.nn.Module], torch.nn.Module]
 
-class ChiralEvaluationProbe(TrainingCallback):
+
+class BdGEvaluationProbe(TrainingCallback):
     """Records energy / edge-weight / eigenvector errors against ``eigh``.
 
     A :class:`~kitaev.training.callbacks.TrainingCallback` that evaluates the
@@ -72,6 +83,15 @@ class ChiralEvaluationProbe(TrainingCallback):
             weight.
         session: Optional :class:`sesh.Session`; when given, each
             evaluation is also written to the run log.
+        adapt: Optional callable mapping the model under training to one
+            whose ``forward`` returns ``(E_pred, psi_pred)`` with
+            ``psi_pred`` a ``(batch, 2 * n_sites)`` Nambu-basis tensor and
+            ``E_pred`` broadcastable to ``(batch,)``. Pass ``None`` (the
+            default) when the model already returns that pair, e.g. a
+            dual-head model. For the chiral model pass
+            ``lambda m: ChiralToBdGAdapter(m, hopping=t, pairing=delta)``.
+            The adapted object must be an ``nn.Module`` sharing the model's
+            parameters.
     """
 
     def __init__(
@@ -84,6 +104,7 @@ class ChiralEvaluationProbe(TrainingCallback):
         every: int = 100,
         n_edge_sites: int = 2,
         session: Session | None = None,
+        adapt: ModelAdapter | None = None,
     ) -> None:
         """Diagonalise the exact references once and cache them."""
         self.n_sites = n_sites
@@ -92,6 +113,7 @@ class ChiralEvaluationProbe(TrainingCallback):
         self.every = every
         self.n_edge_sites = n_edge_sites
         self.session = session
+        self.adapt = adapt
 
         if mu_grid is None:
             mu_grid = np.linspace(0.05, 4.0 * hopping, 200)
@@ -143,25 +165,28 @@ class ChiralEvaluationProbe(TrainingCallback):
         history: TrainingHistory,
     ) -> None:
         """Run one forward sweep and append the ``probe_*`` metrics."""
-        device = next(model.parameters()).device
-        adapter = ChiralToBdGAdapter(
-            cast(SirenPINNChiral, model),
-            hopping=self.hopping,
-            pairing=self.pairing,
-        ).to(device)
+        eval_model = self.adapt(model) if self.adapt is not None else model
 
         was_training = model.training
-        adapter.eval()
+        eval_model.eval()
+        device = next(model.parameters()).device
         with torch.no_grad():
             mu_tensor = torch.tensor(
                 self.mu_grid[:, None], dtype=torch.float32, device=device
             )
-            e_pred_t, psi_pred_t = adapter(mu_tensor)
+            e_pred_t, psi_pred_t = eval_model(mu_tensor)
         if was_training:
             model.train()
 
-        e_pred = e_pred_t.cpu().numpy().ravel()
-        psi_pred = psi_pred_t.cpu().numpy()
+        # |E|: E and -E are the same physical state; models that do not
+        # branch-resolve their Rayleigh quotient may return either sign.
+        e_pred = np.abs(e_pred_t.detach().cpu().numpy().reshape(-1))
+        psi_pred = psi_pred_t.detach().cpu().numpy()
+
+        # Normalise psi for the density / subspace metrics; report the raw
+        # norm separately so a non-normalising model is still visible.
+        psi_norm = np.linalg.norm(psi_pred, axis=1)
+        psi_unit = psi_pred / np.clip(psi_norm, 1e-12, None)[:, None]
 
         abs_err = np.abs(e_pred - self._e_exact)
         topological = self.mu_grid < self._transition
@@ -169,12 +194,12 @@ class ChiralEvaluationProbe(TrainingCallback):
 
         n_sites = self.n_sites
         edge = self._edge_sites
-        edge_pred = (psi_pred[:, :n_sites][:, edge] ** 2).sum(axis=1) + (
-            psi_pred[:, n_sites:][:, edge] ** 2
+        edge_pred = (psi_unit[:, :n_sites][:, edge] ** 2).sum(axis=1) + (
+            psi_unit[:, n_sites:][:, edge] ** 2
         ).sum(axis=1)
         edge_err = np.abs(edge_pred - self._edge_exact)
 
-        projection = np.einsum("gij,gi->gj", self._near_zero, psi_pred)
+        projection = np.einsum("gij,gi->gj", self._near_zero, psi_unit)
         infidelity = 1.0 - np.linalg.norm(projection, axis=1)
 
         metrics = {
@@ -185,6 +210,7 @@ class ChiralEvaluationProbe(TrainingCallback):
             "probe_edge_mae": float(edge_err.mean()),
             "probe_subspace_infidelity": float(infidelity.mean()),
             "probe_subspace_infidelity_max": float(infidelity.max()),
+            "probe_psi_norm": float(psi_norm.mean()),
         }
         for key, value in metrics.items():
             history.record(key, value)
