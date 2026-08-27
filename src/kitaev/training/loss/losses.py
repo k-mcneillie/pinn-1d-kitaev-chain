@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 
+from kitaev.analytical import chiral_block_batched
+
 from . import BaseLoss
 
 
@@ -257,3 +259,166 @@ class SemiSupervisedLoss(BaseLoss):
             "ph": loss_ph.item(),
             "physics_wt": physics_weight,
         }
+
+
+class ChiralFSMLoss(BaseLoss):
+    """Folded-spectrum loss on the Majorana-basis chiral block ``h(mu)``.
+
+    Intended for :class:`kitaev.models.SirenPINNChiral`, which returns the
+    left/right singular vectors ``(u, v)`` of the smallest singular value of
+    the real ``N x N`` bidiagonal operator ``h(mu)`` (see
+    :func:`kitaev.analytical.chiral_block`). Because the singular values of
+    ``h(mu)`` are exactly the non-negative BdG eigenvalues, and the model
+    normalises ``u`` and ``v`` by construction, this loss needs neither a
+    normalisation term, an energy-non-negativity term, nor a particle-hole
+    residual: those are all structural. What remains is the pair
+
+        loss = loss_fsm + loss_var
+
+    with no relative weight and no annealing schedule:
+
+        loss_fsm:
+            ``mean(||h v||^2) + mean(||h^T u||^2)``. The folded-spectrum
+            residual: driving both to zero pushes ``(u, v)`` onto the
+            directions of the *smallest* singular value of ``h(mu)`` -- the
+            near-null space in the topological phase, the smallest bulk gap
+            otherwise. Directly analogous to
+            :class:`PinnedFSMLoss`'s ``mean(||H psi||^2)``.
+        loss_var:
+            ``mean(||h v - lambda_R u||^2) + mean(||h^T u - lambda_R v||^2)``
+            with ``lambda_R = u^T h v`` the Rayleigh-quotient singular value.
+            Forces ``(u, v)`` to be a genuine matched singular pair, so that
+            ``lambda_R`` is a meaningful energy. Analogous to
+            :class:`PinnedFSMLoss`'s ``loss_var``.
+
+    The reported ``lam_mean`` metric is the batch mean of ``|lambda_R|`` --
+    the model's energy estimate. The absolute value is taken because the
+    loss is invariant under ``(u, v) -> (u, -v)``, which negates
+    ``lambda_R``; the sign carries no information and
+    :func:`kitaev.analytical.resolve_singular_branch` fixes the branch at
+    reconstruction time.
+
+    ``H_base``, ``H_mu_diag``, ``Xi`` and ``epoch`` are accepted to match the
+    :class:`BaseLoss` call contract but are unused: this loss builds its own
+    ``h(mu)`` from ``mu_batch``.
+
+    Attributes:
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+    """
+
+    def __init__(
+        self,
+        n_sites: int,
+        *,
+        hopping: float = 1.0,
+        pairing: float = 0.5,
+    ) -> None:
+        """Initialise the loss with the chain's physical parameters.
+
+        Args:
+            n_sites: Number of physical lattice sites, ``N``.
+            hopping: Nearest-neighbour hopping amplitude, ``t``.
+            pairing: P-wave pairing amplitude, ``delta``. Both ``hopping``
+                and ``pairing`` are in the same energy units as ``mu``.
+        """
+        self.n_sites = n_sites
+        self.hopping = hopping
+        self.pairing = pairing
+
+    def __call__(
+        self,
+        model: torch.nn.Module,
+        mu_batch: torch.Tensor,
+        H_base: torch.Tensor,
+        H_mu_diag: torch.Tensor,
+        Xi: torch.Tensor,
+        epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute the chiral folded-spectrum loss for a batch.
+
+        Args:
+            model: The model being trained. Must return a ``(u, v)`` tuple
+                of unit-norm ``(batch_size, n_sites)`` tensors when called
+                on ``mu_batch``.
+            mu_batch: Batch of mu values, shape ``(batch_size, 1)``.
+            H_base: Unused (kept for the :class:`BaseLoss` contract).
+            H_mu_diag: Unused.
+            Xi: Unused.
+            epoch: Unused (this loss has no annealing schedule).
+
+        Returns:
+            Tuple of ``(total_loss, metrics)``, where ``metrics`` holds the
+            two loss components and the mean Rayleigh-quotient energy.
+        """
+        del H_base, H_mu_diag, Xi, epoch
+
+        u, v = model(mu_batch)
+        h_batch = chiral_block_batched(
+            mu_batch, self.n_sites, self.hopping, self.pairing
+        )
+
+        h_v = torch.bmm(h_batch, v.unsqueeze(-1)).squeeze(-1)
+        ht_u = torch.bmm(h_batch.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
+
+        loss_fsm = torch.mean(h_v**2) + torch.mean(ht_u**2)
+
+        lam_rayleigh = torch.sum(u * h_v, dim=1, keepdim=True)
+
+        loss_var = torch.mean((h_v - lam_rayleigh * u) ** 2) + torch.mean(
+            (ht_u - lam_rayleigh * v) ** 2
+        )
+
+        total_loss = loss_fsm + loss_var
+
+        return total_loss, {
+            "fsm": loss_fsm.item(),
+            "var": loss_var.item(),
+            "lam_mean": lam_rayleigh.abs().mean().item(),
+        }
+
+
+def chiral_pointwise_residual(
+    model: torch.nn.Module,
+    mu_batch: torch.Tensor,
+    n_sites: int,
+    *,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+) -> torch.Tensor:
+    """Per-sample chiral physics residual for residual-adaptive sampling.
+
+    This is the same folded-spectrum + eigenvector-consistency quantity
+    :class:`ChiralFSMLoss` sums into a scalar, but kept **per mu**:
+
+        residual(mu) = ||h(mu) v||^2 + ||h(mu)^T u||^2
+                     + ||h(mu) v - lambda_R u||^2
+                     + ||h(mu)^T u - lambda_R v||^2
+
+    with ``(u, v)`` the model output at ``mu`` and
+    ``lambda_R = u^T h(mu) v``. Used by
+    :class:`kitaev.data.streaming.AdaptiveSampling` to find the mu values
+    where the model is currently doing worst.
+
+    Args:
+        model: A chiral model returning ``(u, v)`` for a mu batch.
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)``.
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+
+    Returns:
+        A tensor of shape ``(batch_size,)`` of non-negative residuals.
+    """
+    u, v = model(mu_batch)
+    h_batch = chiral_block_batched(mu_batch, n_sites, hopping, pairing)
+
+    h_v = torch.bmm(h_batch, v.unsqueeze(-1)).squeeze(-1)
+    ht_u = torch.bmm(h_batch.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
+    lam = torch.sum(u * h_v, dim=1, keepdim=True)
+
+    fsm = (h_v**2).sum(dim=1) + (ht_u**2).sum(dim=1)
+    var = ((h_v - lam * u) ** 2).sum(dim=1) + ((ht_u - lam * v) ** 2).sum(dim=1)
+    residual: torch.Tensor = fsm + var
+    return residual
