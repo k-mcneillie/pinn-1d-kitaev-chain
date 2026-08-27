@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -15,7 +16,8 @@ from kitaev.data.generators.unsupervised import UnsupervisedMuGenerator
 from kitaev.data.mu_sampler import MuSampler
 from kitaev.data.sampling_region import TRANSITION_FOCUSED_REGIONS
 
-from .config import TrainerConfig
+from .callbacks import TrainingCallback
+from .config import TrainerConfig, TwoPhaseConfig
 from .loss import BaseLoss, PinnedFSMLoss
 from .utils import EarlyStopping, EpochAccumulator, TrainingHistory
 
@@ -64,6 +66,7 @@ class UnifiedTrainer:
         optimiser: optim.Optimizer,
         scheduler: optim.lr_scheduler.LRScheduler | None = None,
         config: TrainerConfig | None = None,
+        callbacks: Sequence[TrainingCallback] = (),
     ) -> None:
         """Wires together the trainer's collaborators and prepares them via accelerate.
 
@@ -82,11 +85,17 @@ class UnifiedTrainer:
                 scheduler wrapping ``optimiser``.
             config: Training hyperparameters. Defaults to
                 ``TrainerConfig()`` if omitted.
+            callbacks: Optional :class:`~kitaev.training.callbacks.TrainingCallback`
+                objects, invoked in order at the start and end of every
+                epoch. Used by the streaming sampling strategies in
+                :mod:`kitaev.training.sampling` to update what the next
+                epoch samples; empty (no hooks) by default.
         """
         self.session = session
         self.accelerator = accelerator
         self.loss_fn = loss_fn
         self.config = config or TrainerConfig()
+        self.callbacks = tuple(callbacks)
         self.history = TrainingHistory()
         self._early_stopping = EarlyStopping(self.config.patience)
 
@@ -178,6 +187,8 @@ class UnifiedTrainer:
         )
 
         for epoch in range(1, self.config.epochs + 1):
+            self._run_callbacks("on_epoch_start", epoch)
+
             train_metrics = self._run_epoch(
                 train_loader,
                 H_base,
@@ -209,6 +220,8 @@ class UnifiedTrainer:
                 should_stop = self._early_stopping.step(
                     val_metrics["loss"], epoch, unwrapped_model
                 )
+
+            self._run_callbacks("on_epoch_end", epoch)
 
             if epoch % self.config.print_freq == 0 or epoch == self.config.epochs:
                 self._log_epoch(epoch, train_metrics, val_metrics)
@@ -464,6 +477,19 @@ class UnifiedTrainer:
         while True:
             yield from loader
 
+    def _run_callbacks(self, hook: str, epoch: int) -> None:
+        """Invokes ``hook`` on every registered callback, in order.
+
+        Args:
+            hook: Either ``"on_epoch_start"`` or ``"on_epoch_end"``.
+            epoch: The 1-based epoch number to pass through.
+        """
+        if not self.callbacks:
+            return
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        for callback in self.callbacks:
+            getattr(callback, hook)(epoch, unwrapped_model, self.history)
+
     def _record(self, split: str, metrics: dict[str, float]) -> None:
         """Appends a split's averaged metrics into the training history.
 
@@ -532,6 +558,169 @@ class UnifiedTrainer:
                 f"val loss: {self._early_stopping.best_loss:.6f})."
             )
         return unwrapped_model
+
+
+def _concat_histories(*histories: TrainingHistory) -> TrainingHistory:
+    """Concatenates several run histories end to end into one.
+
+    Args:
+        *histories: Populated :class:`TrainingHistory` objects, in the
+            order they ran.
+
+    Returns:
+        A new :class:`TrainingHistory` whose every series is the
+        corresponding series from each input appended in turn.
+    """
+    merged = TrainingHistory()
+    for history in histories:
+        for key, series in history.as_dict().items():
+            for value in series:
+                merged.record(key, value)
+    return merged
+
+
+def run_two_phase(
+    session: Session,
+    accelerator: Accelerator,
+    model: nn.Module,
+    loss_fn: BaseLoss,
+    train_loader: DataLoader,
+    H_base: torch.Tensor,
+    H_mu_diag: torch.Tensor,
+    Xi: torch.Tensor,
+    *,
+    two_phase: TwoPhaseConfig | None = None,
+    base_config: TrainerConfig | None = None,
+    callbacks: Sequence[TrainingCallback] = (),
+    val_loader: DataLoader | None = None,
+    unlabeled_loader: DataLoader | None = None,
+    lbfgs_train_loader: DataLoader | None = None,
+    lbfgs_callbacks: Sequence[TrainingCallback] | None = None,
+) -> tuple[nn.Module, TrainingHistory]:
+    """Runs an AdamW warm-up then an L-BFGS fine-tuning phase on one model.
+
+    Builds and runs two :class:`UnifiedTrainer` instances back to back over
+    the *same* model: first AdamW (with a cosine schedule) for
+    ``two_phase.adam_epochs``, then L-BFGS for ``two_phase.lbfgs_epochs``
+    starting from the AdamW result. This is the standard PINN optimiser
+    recipe — see :class:`~kitaev.training.config.TwoPhaseConfig`.
+
+    Args:
+        session: The run's :class:`sesh.Session`.
+        accelerator: The shared :class:`accelerate.Accelerator`.
+        model: The model to train. Must not have been passed to
+            ``accelerator.prepare`` yet.
+        loss_fn: The physics loss.
+        train_loader: The label-free training loader (frozen or streaming).
+        H_base: Mu-independent part of the batched Hamiltonian, on device.
+        H_mu_diag: Diagonal mu operator, on device.
+        Xi: Particle-hole operator, on device.
+        two_phase: The two-phase schedule. Defaults to
+            :class:`TwoPhaseConfig`.
+        base_config: Template :class:`TrainerConfig` for both phases; each
+            phase overrides ``epochs`` (and the L-BFGS phase disables
+            gradient clipping). Defaults to :class:`TrainerConfig`.
+        callbacks: Trainer callbacks forwarded to the AdamW phase (e.g. a
+            sampling strategy). They are forwarded to the L-BFGS phase too
+            *unless* ``lbfgs_train_loader`` is given (a fixed objective is the
+            whole point of passing a dedicated loader) or ``lbfgs_callbacks``
+            is set, either of which replaces them for that phase.
+        val_loader: Optional validation loader, used in both phases.
+        unlabeled_loader: Optional label-free loader concatenated onto the
+            train batch, for semi-supervised losses.
+        lbfgs_train_loader: Optional loader for the L-BFGS phase only.
+            L-BFGS builds its inverse-Hessian estimate from gradient
+            differences across steps and is destabilised when each step sees
+            a freshly drawn batch (as ``mode="infinite"`` and the other
+            streaming samplers produce). Pass a fixed, large-batch
+            ``mode="frozen"`` loader here so the second phase optimises a
+            stationary objective. Defaults to ``train_loader``.
+        lbfgs_callbacks: Explicit callback list for the L-BFGS phase. Use it
+            to keep a diagnostic callback (e.g.
+            :class:`~kitaev.training.probes.ChiralEvaluationProbe`) running in
+            the second phase while dropping the streaming sampler that came
+            with ``callbacks``. When ``None`` (the default) the L-BFGS phase
+            uses ``callbacks``, or ``()`` if ``lbfgs_train_loader`` is set.
+
+    Returns:
+        ``(model, history)`` — the fine-tuned model and the two phases'
+        histories concatenated end to end.
+    """
+    two_phase = two_phase or TwoPhaseConfig()
+    base_config = base_config or TrainerConfig()
+
+    adam = optim.AdamW(
+        model.parameters(),
+        lr=two_phase.adam_lr,
+        weight_decay=two_phase.adam_weight_decay,
+    )
+    adam_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        adam, T_max=max(1, two_phase.adam_epochs)
+    )
+    adam_config = replace(base_config, epochs=two_phase.adam_epochs)
+    phase_one = UnifiedTrainer(
+        session=session,
+        accelerator=accelerator,
+        model=model,
+        loss_fn=loss_fn,
+        optimiser=adam,
+        scheduler=adam_scheduler,
+        config=adam_config,
+        callbacks=callbacks,
+    )
+    session.info("--- Two-phase: AdamW warm-up ---")
+    model = phase_one.fit(
+        train_loader,
+        H_base,
+        H_mu_diag,
+        Xi,
+        val_loader=val_loader,
+        unlabeled_loader=unlabeled_loader,
+    )
+
+    if two_phase.lbfgs_epochs <= 0:
+        return model, phase_one.history
+
+    lbfgs = optim.LBFGS(
+        model.parameters(),
+        lr=two_phase.lbfgs_lr,
+        max_iter=two_phase.lbfgs_max_iter,
+        history_size=two_phase.lbfgs_history_size,
+        line_search_fn=two_phase.lbfgs_line_search_fn,
+    )
+    lbfgs_config = replace(
+        base_config, epochs=two_phase.lbfgs_epochs, grad_clip_norm=None
+    )
+    lbfgs_loader = (
+        lbfgs_train_loader if lbfgs_train_loader is not None else train_loader
+    )
+    if lbfgs_callbacks is not None:
+        phase_two_callbacks: Sequence[TrainingCallback] = lbfgs_callbacks
+    elif lbfgs_train_loader is not None:
+        phase_two_callbacks = ()
+    else:
+        phase_two_callbacks = callbacks
+    phase_two = UnifiedTrainer(
+        session=session,
+        accelerator=accelerator,
+        model=model,
+        loss_fn=loss_fn,
+        optimiser=lbfgs,
+        scheduler=None,
+        config=lbfgs_config,
+        callbacks=phase_two_callbacks,
+    )
+    session.info("--- Two-phase: L-BFGS fine-tuning ---")
+    model = phase_two.fit(
+        lbfgs_loader,
+        H_base,
+        H_mu_diag,
+        Xi,
+        val_loader=val_loader,
+        unlabeled_loader=unlabeled_loader,
+    )
+
+    return model, _concat_histories(phase_one.history, phase_two.history)
 
 
 # ======================================================================
