@@ -67,6 +67,7 @@ class UnifiedTrainer:
         scheduler: optim.lr_scheduler.LRScheduler | None = None,
         config: TrainerConfig | None = None,
         callbacks: Sequence[TrainingCallback] = (),
+        start_epoch: int = 1,
     ) -> None:
         """Wires together the trainer's collaborators and prepares them via accelerate.
 
@@ -90,12 +91,22 @@ class UnifiedTrainer:
                 epoch. Used by the streaming sampling strategies in
                 :mod:`kitaev.training.sampling` to update what the next
                 epoch samples; empty (no hooks) by default.
+            start_epoch: The epoch number the loop counts from. Defaults
+                to ``1``; :func:`run_two_phase` passes
+                ``adam_epochs + 1`` for the L-BFGS phase so the second
+                phase continues the first phase's epoch numbering rather
+                than restarting at ``1``. This matters for any
+                :class:`~kitaev.training.loss.BaseLoss` with an
+                epoch-keyed schedule (e.g. ``SemiSupervisedLoss``'s
+                ``physics_weight`` anneal), which would otherwise reset
+                when the second phase begins.
         """
         self.session = session
         self.accelerator = accelerator
         self.loss_fn = loss_fn
         self.config = config or TrainerConfig()
         self.callbacks = tuple(callbacks)
+        self.start_epoch = start_epoch
         self.history = TrainingHistory()
         self._early_stopping = EarlyStopping(self.config.patience)
 
@@ -186,7 +197,8 @@ class UnifiedTrainer:
             self._cycle(unlabeled_loader) if unlabeled_loader is not None else None
         )
 
-        for epoch in range(1, self.config.epochs + 1):
+        final_epoch = self.start_epoch + self.config.epochs - 1
+        for epoch in range(self.start_epoch, final_epoch + 1):
             self._run_callbacks("on_epoch_start", epoch)
 
             train_metrics = self._run_epoch(
@@ -223,7 +235,7 @@ class UnifiedTrainer:
 
             self._run_callbacks("on_epoch_end", epoch)
 
-            if epoch % self.config.print_freq == 0 or epoch == self.config.epochs:
+            if epoch % self.config.print_freq == 0 or epoch == final_epoch:
                 self._log_epoch(epoch, train_metrics, val_metrics)
 
             if should_stop:
@@ -595,6 +607,7 @@ def run_two_phase(
     val_loader: DataLoader | None = None,
     unlabeled_loader: DataLoader | None = None,
     lbfgs_train_loader: DataLoader | None = None,
+    lbfgs_unlabeled_loader: DataLoader | None = None,
     lbfgs_callbacks: Sequence[TrainingCallback] | None = None,
 ) -> tuple[nn.Module, TrainingHistory]:
     """Runs an AdamW warm-up then an L-BFGS fine-tuning phase on one model.
@@ -604,6 +617,12 @@ def run_two_phase(
     ``two_phase.adam_epochs``, then L-BFGS for ``two_phase.lbfgs_epochs``
     starting from the AdamW result. This is the standard PINN optimiser
     recipe — see :class:`~kitaev.training.config.TwoPhaseConfig`.
+
+    The two phases share one continuous epoch axis: the L-BFGS phase counts
+    from ``adam_epochs + 1`` (via ``UnifiedTrainer(start_epoch=...)``), not
+    from ``1``, so an epoch-keyed loss schedule such as
+    ``SemiSupervisedLoss``'s ``physics_weight`` anneal keeps the value it
+    had reached at the AdamW hand-over instead of resetting.
 
     Args:
         session: The run's :class:`sesh.Session`.
@@ -634,7 +653,18 @@ def run_two_phase(
             a freshly drawn batch (as ``mode="infinite"`` and the other
             streaming samplers produce). Pass a fixed, large-batch
             ``mode="frozen"`` loader here so the second phase optimises a
-            stationary objective. Defaults to ``train_loader``.
+            stationary objective. Defaults to ``train_loader``. For a
+            semi-supervised run this is the labelled loader; pass it as a
+            single full-size batch (``batch_size=len(dataset)``,
+            ``shuffle=False``) so the labelled contribution is fixed too.
+        lbfgs_unlabeled_loader: Optional label-free loader for the L-BFGS
+            phase only, the ``unlabeled_loader`` counterpart of
+            ``lbfgs_train_loader``. When a semi-supervised run streams
+            label-free collocation points through ``unlabeled_loader``,
+            each L-BFGS step would otherwise see a different label-free
+            batch and break the stationarity the quasi-Newton update
+            relies on. Pass a single fixed ``mode="frozen"`` batch here.
+            Defaults to ``unlabeled_loader``.
         lbfgs_callbacks: Explicit callback list for the L-BFGS phase. Use it
             to keep a diagnostic callback (e.g.
             :class:`~kitaev.training.probes.BdGEvaluationProbe`) running in
@@ -694,6 +724,11 @@ def run_two_phase(
     lbfgs_loader = (
         lbfgs_train_loader if lbfgs_train_loader is not None else train_loader
     )
+    lbfgs_unlabeled = (
+        lbfgs_unlabeled_loader
+        if lbfgs_unlabeled_loader is not None
+        else unlabeled_loader
+    )
     if lbfgs_callbacks is not None:
         phase_two_callbacks: Sequence[TrainingCallback] = lbfgs_callbacks
     elif lbfgs_train_loader is not None:
@@ -709,6 +744,7 @@ def run_two_phase(
         scheduler=None,
         config=lbfgs_config,
         callbacks=phase_two_callbacks,
+        start_epoch=two_phase.adam_epochs + 1,
     )
     session.info("--- Two-phase: L-BFGS fine-tuning ---")
     model = phase_two.fit(
@@ -717,7 +753,7 @@ def run_two_phase(
         H_mu_diag,
         Xi,
         val_loader=val_loader,
-        unlabeled_loader=unlabeled_loader,
+        unlabeled_loader=lbfgs_unlabeled,
     )
 
     return model, _concat_histories(phase_one.history, phase_two.history)
