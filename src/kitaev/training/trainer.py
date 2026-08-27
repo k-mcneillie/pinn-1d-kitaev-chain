@@ -637,7 +637,7 @@ def run_two_phase(
             stationary objective. Defaults to ``train_loader``.
         lbfgs_callbacks: Explicit callback list for the L-BFGS phase. Use it
             to keep a diagnostic callback (e.g.
-            :class:`~kitaev.training.probes.ChiralEvaluationProbe`) running in
+            :class:`~kitaev.training.probes.BdGEvaluationProbe`) running in
             the second phase while dropping the streaming sampler that came
             with ``callbacks``. When ``None`` (the default) the L-BFGS phase
             uses ``callbacks``, or ``()`` if ``lbfgs_train_loader`` is set.
