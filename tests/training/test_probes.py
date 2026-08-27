@@ -251,5 +251,21 @@ def test_probe_reports_nan_when_a_phase_has_no_grid_points() -> None:
     assert not math.isnan(history["probe_e_mae_trivial"][-1])
 
 
+def test_probe_phase_split_uses_absolute_mu() -> None:
+    # A wholly negative, wholly trivial grid (|mu| in [2.5, 4.0]): the split
+    # is on |mu| < 2t, so every point is trivial and the topological mean is
+    # NaN. A naive ``mu < 2t`` split would misclassify all of these as
+    # topological.
+    probe = _probe(mu_grid=np.linspace(-4.0, -2.5, 20), every=1)
+    model = _ExactEPsiModel(N_SITES, HOPPING, PAIRING)
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    assert math.isnan(history["probe_e_mae_topological"][-1])
+    assert not math.isnan(history["probe_e_mae_trivial"][-1])
+    assert history["probe_e_mae_trivial"][-1] == pytest.approx(0.0, abs=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main()
