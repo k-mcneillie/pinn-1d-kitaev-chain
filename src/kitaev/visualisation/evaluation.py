@@ -53,6 +53,17 @@ class WavefunctionSweep:
         hole_exact: Exact hole-sector ``|psi_n|^2``, same shape.
         particle_pred: Model particle-sector ``|psi_n|^2``, same shape.
         hole_pred: Model hole-sector ``|psi_n|^2``, same shape.
+        manifold_density: Optional gauge-invariant near-zero manifold
+            density ``rho(n) = |psi_+(n)|^2 + |psi_-(n)|^2`` split into
+            ``[particle, hole]`` halves, shape ``(len(probe_mus), 2,
+            n_sites)``. Rows for trivial-phase mu values (where the
+            ``+-lambda_1`` pair is not degenerate) are ``np.nan``. ``None``
+            when the sweep did not compute it (see
+            :func:`sweep_wavefunction_grid`).
+        branch: Optional per-mu record of whether the raw model eigenvector
+            was kept (``"keep"``) or particle/hole-swapped (``"Xi-flip"``)
+            to align its branch with the reference, one entry per probe mu.
+            ``None`` when no branch alignment was applied.
     """
 
     probe_mus: Sequence[float]
@@ -61,6 +72,68 @@ class WavefunctionSweep:
     hole_exact: npt.NDArray[np.float64]
     particle_pred: npt.NDArray[np.float64]
     hole_pred: npt.NDArray[np.float64]
+    manifold_density: npt.NDArray[np.float64] | None = None
+    branch: list[str] | None = None
+
+
+@dataclass
+class SpectralSweep:
+    """Exact-vs-model spectrum, edge weight and eigenvector fidelity over a mu grid.
+
+    The data behind the project's standard "energy sweep" and "eigenvector
+    agreement" figures: one exact-diagonalisation pass and one batched
+    model forward over the same grid.
+
+    Attributes:
+        mu: The mu grid swept over, shape ``(n_points,)``.
+        energy_exact: Exact lowest non-negative eigenvalue at each mu.
+        energy_pred_signed: Model energy at each mu, sign as returned by the
+            adapter (a model without a resolved ``+-E`` branch may return
+            either sign).
+        energy_pred: ``|energy_pred_signed|`` -- ``E`` and ``-E`` are the
+            same physical state, so this is what the error is measured on.
+        abs_error: ``|energy_pred - energy_exact|`` at each mu.
+        edge_weight_exact: Exact combined (particle + hole) weight on the
+            outermost ``n_edge_sites`` sites of each end.
+        edge_weight_pred: Model combined edge weight, from the unit-norm
+            predicted eigenvector.
+        subspace_fidelity: ``||P psi_pred||`` at each mu, where ``P``
+            projects onto the span of the two exact eigenvectors of
+            smallest ``|E|`` -- the eigenvector-accuracy measure that stays
+            well defined where the ``+-lambda_1`` pair is degenerate.
+        transition: The topological transition, ``2 * hopping``.
+        n_edge_sites: Sites counted at each end for the edge weight.
+    """
+
+    mu: npt.NDArray[np.float64]
+    energy_exact: npt.NDArray[np.float64]
+    energy_pred_signed: npt.NDArray[np.float64]
+    energy_pred: npt.NDArray[np.float64]
+    abs_error: npt.NDArray[np.float64]
+    edge_weight_exact: npt.NDArray[np.float64]
+    edge_weight_pred: npt.NDArray[np.float64]
+    subspace_fidelity: npt.NDArray[np.float64]
+    transition: float
+    n_edge_sites: int
+
+
+@dataclass
+class MuReflectionSweep:
+    """Model spectrum at ``+mu`` vs ``-mu``, to show evenness in ``mu``.
+
+    Attributes:
+        mu_half: The non-negative mu values probed, shape ``(n_points,)``.
+        energy_pos: ``|E_pred(+mu)|`` at each ``mu_half`` value.
+        energy_neg: ``|E_pred(-mu)|`` at each ``mu_half`` value.
+        max_abs_diff: ``max |energy_pos - energy_neg|`` -- zero when
+            evenness in ``mu`` is structural, small but non-zero when it is
+            only learned.
+    """
+
+    mu_half: npt.NDArray[np.float64]
+    energy_pos: npt.NDArray[np.float64]
+    energy_neg: npt.NDArray[np.float64]
+    max_abs_diff: float
 
 
 def _edge_sites(n_sites: int, n_edge_sites: int) -> npt.NDArray[np.int64]:
@@ -185,4 +258,215 @@ def sweep_wavefunctions(
         hole_exact=hole_exact,
         particle_pred=prob_pred[:, :n_sites],
         hole_pred=prob_pred[:, n_sites:],
+    )
+
+
+def sweep_spectrum(
+    model: torch.nn.Module,
+    hamiltonian: KitaevChainHamiltonian,
+    mu_grid: npt.NDArray[np.float64],
+    *,
+    device: torch.device | str = "cpu",
+    n_edge_sites: int = 2,
+) -> SpectralSweep:
+    """Sweep energy, edge weight and eigenvector fidelity over a mu grid.
+
+    One exact-diagonalisation pass caches, per mu, the lowest non-negative
+    eigenvalue, its edge weight, and the two eigenvectors of smallest
+    ``|E|``; the model is then evaluated once, batched, over the whole
+    grid. This is the data behind
+    :func:`kitaev.visualisation.figures.plot_energy_sweep` and
+    :func:`kitaev.visualisation.figures.plot_eigenvector_agreement`.
+
+    Args:
+        model: A trained model (or adapter) that returns an
+            ``(E_pred, psi_pred)`` tuple, with ``psi_pred`` a
+            ``(batch, 2N)`` Nambu-basis vector. Switched to eval mode and
+            run under ``torch.no_grad()``.
+        hamiltonian: The exact Hamiltonian to diagonalise at each mu.
+        mu_grid: 1D array of mu values to evaluate at.
+        device: Device for the model forward pass.
+        n_edge_sites: Sites counted at each end of the chain for the edge
+            weight.
+
+    Returns:
+        The populated :class:`SpectralSweep`.
+    """
+    mu_grid = np.asarray(mu_grid, dtype=float)
+    n_sites = hamiltonian.n_sites
+    split_index = n_sites
+    edge_sites = _edge_sites(n_sites, n_edge_sites)
+
+    energy_exact = np.zeros_like(mu_grid)
+    edge_weight_exact = np.zeros_like(mu_grid)
+    near_zero = np.zeros((mu_grid.size, 2 * n_sites, 2))
+    for i, mu in enumerate(mu_grid):
+        eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
+        energy_exact[i] = eigenvalues[split_index]
+        psi = eigenvectors[:, split_index]
+        edge_weight_exact[i] = (psi[:n_sites][edge_sites] ** 2).sum() + (
+            psi[n_sites:][edge_sites] ** 2
+        ).sum()
+        near_zero[i] = eigenvectors[:, np.argsort(np.abs(eigenvalues))[:2]]
+
+    model.eval()
+    with torch.no_grad():
+        mu_tensor = torch.tensor(mu_grid[:, None], dtype=torch.float32, device=device)
+        e_pred_t, psi_pred_t = model(mu_tensor)
+    energy_pred_signed = e_pred_t.detach().cpu().numpy().reshape(-1)
+    psi_pred = psi_pred_t.detach().cpu().numpy()
+
+    psi_norm = np.linalg.norm(psi_pred, axis=1, keepdims=True)
+    psi_unit = psi_pred / np.clip(psi_norm, 1e-12, None)
+
+    energy_pred = np.abs(energy_pred_signed)
+    abs_error = np.abs(energy_pred - energy_exact)
+
+    edge_weight_pred = (psi_unit[:, :n_sites][:, edge_sites] ** 2).sum(axis=1) + (
+        psi_unit[:, n_sites:][:, edge_sites] ** 2
+    ).sum(axis=1)
+
+    projection = np.einsum("gij,gi->gj", near_zero, psi_unit)
+    subspace_fidelity = np.linalg.norm(projection, axis=1)
+
+    return SpectralSweep(
+        mu=mu_grid,
+        energy_exact=energy_exact,
+        energy_pred_signed=energy_pred_signed,
+        energy_pred=energy_pred,
+        abs_error=abs_error,
+        edge_weight_exact=edge_weight_exact,
+        edge_weight_pred=edge_weight_pred,
+        subspace_fidelity=subspace_fidelity,
+        transition=2.0 * hamiltonian.hopping,
+        n_edge_sites=n_edge_sites,
+    )
+
+
+def sweep_wavefunction_grid(
+    model: torch.nn.Module,
+    hamiltonian: KitaevChainHamiltonian,
+    probe_mus: Sequence[float],
+    *,
+    device: torch.device | str = "cpu",
+    branch_align: bool = True,
+) -> WavefunctionSweep:
+    """Probe wavefunctions at chosen mu values, with branch alignment and rho.
+
+    Extends :func:`sweep_wavefunctions` with the two pieces the standard
+    density figure needs beyond a raw exact-vs-model overlay:
+
+    - **Branch alignment.** A model whose ``+-E`` branch is only a gauge
+      (no ``loss_pin``, no structural resolver) can settle on ``Xi psi``
+      in the trivial phase -- particle and hole sectors swapped relative
+      to ``eigh``'s column. For each trivial-phase mu, whichever of
+      ``{psi, Xi psi}`` better overlaps the reference is kept before the
+      split into sectors. Topological columns are left raw (a ``Xi`` flip
+      is nearly a no-op on their density, and they only ever illustrate one
+      arbitrary section of the degenerate manifold).
+    - **Manifold density.** For topological mu values, the gauge-invariant
+      ``rho(n) = |psi_+(n)|^2 + |psi_-(n)|^2`` from the two smallest-``|E|``
+      eigenvectors, so the figure can show ``rho / 2`` -- the density a
+      balanced energy eigenstate would have.
+
+    Args:
+        model: A trained model (or adapter) returning ``(E_pred,
+            psi_pred)``.
+        hamiltonian: The exact Hamiltonian to diagonalise at each probe mu.
+        probe_mus: The mu values to probe.
+        device: Device for the model forward pass.
+        branch_align: When ``True`` (default) apply the trivial-phase
+            branch alignment described above; when ``False`` every column
+            is left raw and ``branch`` is all ``"keep"``.
+
+    Returns:
+        A :class:`WavefunctionSweep` with ``manifold_density`` and
+        ``branch`` populated.
+    """
+    n_sites = hamiltonian.n_sites
+    split_index = n_sites
+    sites = np.arange(n_sites)
+    transition = 2.0 * hamiltonian.hopping
+
+    particle_exact = np.zeros((len(probe_mus), n_sites))
+    hole_exact = np.zeros((len(probe_mus), n_sites))
+    particle_pred = np.zeros((len(probe_mus), n_sites))
+    hole_pred = np.zeros((len(probe_mus), n_sites))
+    manifold_density = np.full((len(probe_mus), 2, n_sites), np.nan)
+    branch: list[str] = []
+
+    model.eval()
+    with torch.no_grad():
+        mu_tensor = torch.tensor(
+            [[mu] for mu in probe_mus], dtype=torch.float32, device=device
+        )
+        psi_pred_all = model(mu_tensor)[1].detach().cpu().numpy()
+
+    for col, mu in enumerate(probe_mus):
+        eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
+        psi_ref = eigenvectors[:, split_index]
+        particle_exact[col] = psi_ref[:n_sites] ** 2
+        hole_exact[col] = psi_ref[n_sites:] ** 2
+
+        psi = psi_pred_all[col]
+        psi_xi = np.concatenate([psi[n_sites:], psi[:n_sites]])
+        if (
+            branch_align
+            and abs(mu) >= transition
+            and abs(psi_xi @ psi_ref) > abs(psi @ psi_ref)
+        ):
+            psi = psi_xi
+            branch.append("Xi-flip")
+        else:
+            branch.append("keep")
+        particle_pred[col] = psi[:n_sites] ** 2
+        hole_pred[col] = psi[n_sites:] ** 2
+
+        if abs(mu) < transition:
+            near = eigenvectors[:, np.argsort(np.abs(eigenvalues))[:2]]
+            manifold_density[col, 0] = (near[:n_sites, :] ** 2).sum(axis=1)
+            manifold_density[col, 1] = (near[n_sites:, :] ** 2).sum(axis=1)
+
+    return WavefunctionSweep(
+        probe_mus=list(probe_mus),
+        sites=sites,
+        particle_exact=particle_exact,
+        hole_exact=hole_exact,
+        particle_pred=particle_pred,
+        hole_pred=hole_pred,
+        manifold_density=manifold_density,
+        branch=branch,
+    )
+
+
+def sweep_mu_reflection(
+    model: torch.nn.Module,
+    *,
+    device: torch.device | str = "cpu",
+    mu_max: float = 4.0,
+    n_points: int = 300,
+) -> MuReflectionSweep:
+    """Compare the model's ``|E(+mu)|`` and ``|E(-mu)|`` over ``[0, mu_max]``.
+
+    Args:
+        model: A trained model (or adapter) returning ``(E_pred,
+            psi_pred)``.
+        device: Device for the model forward pass.
+        mu_max: Upper end of the non-negative mu range probed.
+        n_points: Number of points in ``[0, mu_max]``.
+
+    Returns:
+        The populated :class:`MuReflectionSweep`.
+    """
+    mu_half = np.linspace(0.0, mu_max, n_points)
+    model.eval()
+    with torch.no_grad():
+        pos = torch.tensor(mu_half[:, None], dtype=torch.float32, device=device)
+        energy_pos = np.abs(model(pos)[0].detach().cpu().numpy().reshape(-1))
+        energy_neg = np.abs(model(-pos)[0].detach().cpu().numpy().reshape(-1))
+    return MuReflectionSweep(
+        mu_half=mu_half,
+        energy_pos=energy_pos,
+        energy_neg=energy_neg,
+        max_abs_diff=float(np.abs(energy_pos - energy_neg).max()),
     )
