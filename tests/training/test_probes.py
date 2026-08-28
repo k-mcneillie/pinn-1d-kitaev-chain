@@ -13,7 +13,11 @@ from kitaev.analytical import (
     chiral_block,
     reconstruct_bdg_eigenvector,
 )
-from kitaev.models import ChiralToBdGAdapter, SirenPINNChiral
+from kitaev.models import (
+    ChiralToBdGAdapter,
+    RayleighEnergyAdapter,
+    SirenPINNChiral,
+)
 from kitaev.training.probes import BdGEvaluationProbe
 from kitaev.training.utils import TrainingHistory
 
@@ -88,6 +92,34 @@ class _ExactEPsiModel(torch.nn.Module):
             np.array(states), dtype=x.dtype, device=x.device
         )
         return e.unsqueeze(-1), psi
+
+
+class _ExactPsiOnlyModel(torch.nn.Module):
+    """A bare-eigenvector model: returns only the exact lowest ``psi``."""
+
+    def __init__(self, n_sites: int, hopping: float, pairing: float) -> None:
+        super().__init__()
+        self.n_sites = n_sites
+        self._hopping = hopping
+        self._pairing = pairing
+        self.register_parameter("_dummy", torch.nn.Parameter(torch.zeros(1)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        states = []
+        for mu in x.reshape(-1).tolist():
+            h = chiral_block(mu, self.n_sites, self._hopping, self._pairing)
+            left, singular, right_t = np.linalg.svd(h)
+            k = int(np.argmin(singular))
+            states.append(
+                reconstruct_bdg_eigenvector(left[:, k], right_t[k, :], sign=1)
+            )
+        return torch.tensor(np.array(states), dtype=x.dtype, device=x.device)
+
+
+def _rayleigh_adapter(model: torch.nn.Module) -> RayleighEnergyAdapter:
+    return RayleighEnergyAdapter(
+        model, n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING
+    )
 
 
 class _RecordingSession:
@@ -192,6 +224,19 @@ def test_probe_scores_a_direct_e_psi_model_without_an_adapter() -> None:
     assert history["probe_e_mae"][-1] == pytest.approx(0.0, abs=1e-5)
     assert history["probe_edge_mae"][-1] == pytest.approx(0.0, abs=1e-5)
     assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-5)
+
+
+def test_probe_scores_a_bare_psi_model_through_the_rayleigh_adapter() -> None:
+    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1, adapt=_rayleigh_adapter)
+    model = _ExactPsiOnlyModel(N_SITES, HOPPING, PAIRING)
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    assert history["probe_e_mae"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_edge_mae"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-5)
+    assert history["probe_psi_norm"][-1] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_probe_normalises_psi_but_reports_the_raw_norm() -> None:

@@ -4,9 +4,10 @@ from __future__ import annotations
 from unittest import TestCase
 
 import numpy as np
+import torch
 from numpy.linalg import eigvalsh
 
-from kitaev.analytical import KitaevChainHamiltonian
+from kitaev.analytical import KitaevChainHamiltonian, bdg_block_batched
 
 
 class TestKitaevChainHamiltonian(TestCase):  # noqa: N806
@@ -152,6 +153,67 @@ class TestKitaevChainHamiltonian(TestCase):  # noqa: N806
         H1 = h.build(0.5)
         H2 = h(0.5)
         self.assertTrue(np.array_equal(H1, H2))
+
+
+class TestBdgBlockBatched(TestCase):  # noqa: N806
+    """Test suite for the batched Torch BdG builder ``bdg_block_batched``."""
+
+    def test_matches_kitaev_chain_hamiltonian_build(self):
+        """Each slice reproduces ``KitaevChainHamiltonian.build`` exactly."""
+        n_sites, t, d = 6, 1.0, 0.5
+        ham = KitaevChainHamiltonian(n_sites=n_sites, hopping=t, pairing=d)
+        mu = torch.linspace(-4.0, 4.0, 17, dtype=torch.float64)
+
+        batched = bdg_block_batched(mu, n_sites, hopping=t, pairing=d)
+
+        self.assertEqual(batched.shape, (17, 2 * n_sites, 2 * n_sites))
+        for k, mu_k in enumerate(mu.tolist()):
+            expected = torch.tensor(ham.build(mu_k), dtype=torch.float64)
+            self.assertTrue(torch.allclose(batched[k], expected, atol=1e-12))
+
+    def test_each_slice_is_real_symmetric(self):
+        """Every batch element is a real symmetric matrix."""
+        mu = torch.tensor([[-2.7], [0.0], [3.1]])
+        batched = bdg_block_batched(mu, 5, hopping=1.0, pairing=0.3)
+        for slab in batched:
+            self.assertTrue(torch.allclose(slab, slab.T, atol=1e-6))
+
+    def test_linear_in_mu(self):
+        """Only the diagonal moves with mu; the off-diagonal blocks are fixed."""
+        n_sites = 5
+        mu = torch.tensor([-1.5, 0.4, 2.9])
+        batched = bdg_block_batched(mu, n_sites, hopping=1.0, pairing=0.5)
+
+        off_diag_mask = ~torch.eye(2 * n_sites, dtype=torch.bool)
+        first_off = batched[0][off_diag_mask]
+        for slab in batched[1:]:
+            self.assertTrue(torch.allclose(slab[off_diag_mask], first_off))
+
+        # Diagonal: -mu on the particle sector, +mu on the hole sector.
+        for k, mu_k in enumerate(mu.tolist()):
+            diag = torch.diagonal(batched[k])
+            particle = torch.full((n_sites,), -mu_k)
+            hole = torch.full((n_sites,), mu_k)
+            self.assertTrue(torch.allclose(diag[:n_sites], particle))
+            self.assertTrue(torch.allclose(diag[n_sites:], hole))
+
+    def test_accepts_1d_and_2d_mu_identically(self):
+        """``(B,)`` and ``(B, 1)`` inputs give the same result."""
+        flat = torch.tensor([-3.0, 1.0, 2.5])
+        column = flat.unsqueeze(-1)
+        self.assertTrue(
+            torch.allclose(
+                bdg_block_batched(flat, 4),
+                bdg_block_batched(column, 4),
+            )
+        )
+
+    def test_dtype_follows_input(self):
+        """The output dtype and device track ``mu_batch``."""
+        mu = torch.tensor([0.5, -0.5], dtype=torch.float64)
+        out = bdg_block_batched(mu, 3)
+        self.assertEqual(out.dtype, torch.float64)
+        self.assertEqual(out.device, mu.device)
 
 
 if __name__ == "__main__":
