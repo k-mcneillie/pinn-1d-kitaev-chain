@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 
 class KitaevChainHamiltonian:
@@ -234,3 +235,61 @@ class KitaevChainHamiltonian:
             The BdG Hamiltonian evaluated at ``mu``.
         """
         return self.build(mu)
+
+
+def bdg_block_batched(
+    mu_batch: torch.Tensor,
+    n_sites: int,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+) -> torch.Tensor:
+    """Assemble the ``2N x 2N`` BdG Hamiltonian ``H(mu)`` for a batch of ``mu``.
+
+    The Torch, batch-vectorised counterpart of
+    :meth:`KitaevChainHamiltonian.build`, and the Nambu-basis analogue of
+    :func:`kitaev.analytical.chiral_block_batched`. Only the diagonal
+    depends on ``mu_batch`` (``-mu`` in the particle sector, ``+mu`` in the
+    hole sector); the hopping and pairing blocks are constant. The result
+    matches ``KitaevChainHamiltonian(n_sites, hopping, pairing).build(mu)``
+    to machine precision.
+
+    Used to attach a Rayleigh-quotient energy to a bare-eigenvector model
+    via :class:`kitaev.models.RayleighEnergyAdapter`; it does not replace
+    the ``(H_base, H_mu_diag, Xi)`` triple that ``UnifiedTrainer`` and the
+    Nambu-basis losses build for themselves.
+
+    Args:
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)`` or
+            ``(batch_size,)``.
+        n_sites: Number of physical lattice sites, ``N``. The returned
+            matrix is ``2N x 2N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+
+    Returns:
+        A tensor of shape ``(batch_size, 2 * n_sites, 2 * n_sites)``, on the
+        same device and dtype as ``mu_batch``.
+    """
+    mu = mu_batch.reshape(-1)
+    dim = 2 * n_sites
+    device = mu.device
+    block = mu.new_zeros(mu.shape[0], dim, dim)
+
+    site = torch.arange(n_sites - 1, device=device)
+    # Ordinary hopping: particle sector (-t), hole-sector mirror (+t).
+    block[:, site, site + 1] = -hopping
+    block[:, site + 1, site] = -hopping
+    block[:, n_sites + site, n_sites + site + 1] = hopping
+    block[:, n_sites + site + 1, n_sites + site] = hopping
+    # P-wave pairing: antisymmetric across the two orientations of each bond.
+    block[:, site, n_sites + site + 1] = pairing
+    block[:, n_sites + site + 1, site] = pairing
+    block[:, site + 1, n_sites + site] = -pairing
+    block[:, n_sites + site, site + 1] = -pairing
+
+    # On-site chemical potential.
+    diag = torch.arange(n_sites, device=device)
+    block[:, diag, diag] = -mu.unsqueeze(-1)
+    block[:, n_sites + diag, n_sites + diag] = mu.unsqueeze(-1)
+
+    return block
