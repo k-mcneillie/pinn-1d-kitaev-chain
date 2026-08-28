@@ -97,6 +97,97 @@ class PinnedFSMLoss(BaseLoss):
         }
 
 
+class NambuFSMLoss(BaseLoss):
+    """Minimal folded-spectrum loss on the Nambu-basis BdG Hamiltonian.
+
+    The two-term, schedule-free physics loss for a single-head model that
+    returns a ``2N`` Nambu eigenvector (:class:`kitaev.models.SirenPINN` or
+    :class:`kitaev.models.SirenPINNNambuFolded`). It is
+    :class:`PinnedFSMLoss` with ``loss_ph`` and ``loss_pin`` removed -- the
+    Nambu-basis counterpart of :class:`ChiralFSMLoss`, which is already
+    exactly this shape on the ``N x N`` chiral block::
+
+        loss = loss_fsm + loss_var
+
+    with no relative weight and no annealing schedule:
+
+        loss_fsm:
+            ``mean(||H(mu) psi||^2)``. The folded-spectrum residual: its
+            minimiser over the unit sphere is the eigenvector of the
+            eigenvalue nearest zero. Identical to :class:`PinnedFSMLoss`'s
+            ``loss_fsm``.
+        loss_var:
+            ``mean(||H(mu) psi - E_R psi||^2)`` with
+            ``E_R = psi^T H(mu) psi`` the Rayleigh quotient. Forces ``psi``
+            to be a genuine eigenvector, so ``E_R`` is a meaningful energy.
+            Identical to :class:`PinnedFSMLoss`'s ``loss_var``.
+
+    Dropped relative to :class:`PinnedFSMLoss`:
+
+    - ``loss_ph``: ``Xi H Xi = -H`` with ``Xi`` orthogonal makes the
+      particle-hole residual numerically equal to ``loss_var`` term by
+      term, so it carries no independent gradient (see
+      ``docs/markdown/particle-hole-redundancy.md``).
+    - ``loss_pin``: ``loss_fsm + loss_var`` is exactly invariant under
+      ``psi -> Xi psi`` (which sends ``E_R -> -E_R``), so the ``+-E`` branch
+      is an unbroken global gauge. It is resolved at *evaluation* time by
+      sign-alignment to the reference, not by a training penalty. The
+      reported ``lam_mean`` is therefore ``mean(|E_R|)``.
+
+    ``Xi`` and ``epoch`` are accepted to match the :class:`BaseLoss` call
+    contract but are unused: this loss has no ``Xi`` term and no schedule.
+    """
+
+    def __init__(self) -> None:
+        """Initialise the loss. Takes no arguments: no schedule, no weights."""
+
+    def __call__(
+        self,
+        model: torch.nn.Module,
+        mu_batch: torch.Tensor,
+        H_base: torch.Tensor,
+        H_mu_diag: torch.Tensor,
+        Xi: torch.Tensor,
+        epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute the folded-spectrum loss and its components for a batch.
+
+        Args:
+            model: The model being trained. Must return a
+                ``(batch_size, 2N)`` unit-norm Nambu eigenvector when
+                called on ``mu_batch``.
+            mu_batch: Batch of mu values, shape ``(batch_size, 1)``.
+            H_base: Mu-independent part of the batched Hamiltonian.
+            H_mu_diag: Diagonal matrix such that
+                ``H_base + mu * H_mu_diag`` gives ``H(mu)``.
+            Xi: Unused (kept for the :class:`BaseLoss` contract).
+            epoch: Unused (this loss has no annealing schedule).
+
+        Returns:
+            Tuple of ``(total_loss, metrics)``, where ``metrics`` holds the
+            two loss components and the mean absolute Rayleigh-quotient
+            energy.
+        """
+        del Xi, epoch
+
+        psi_pred = model(mu_batch)
+        H_batch = H_base.unsqueeze(0) + mu_batch.unsqueeze(-1) * H_mu_diag.unsqueeze(0)
+
+        H_psi = torch.bmm(H_batch, psi_pred.unsqueeze(-1)).squeeze(-1)
+        loss_fsm = torch.mean(H_psi**2)
+
+        E_rayleigh = torch.sum(psi_pred * H_psi, dim=1, keepdim=True)
+        loss_var = torch.mean((H_psi - E_rayleigh * psi_pred) ** 2)
+
+        total_loss = loss_fsm + loss_var
+
+        return total_loss, {
+            "fsm": loss_fsm.item(),
+            "var": loss_var.item(),
+            "lam_mean": E_rayleigh.abs().mean().item(),
+        }
+
+
 class SemiSupervisedLoss(BaseLoss):
     """Semi-supervised loss combining exact-label data terms with FSM/PH residuals.
 
