@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F  # noqa: N812
 
+from kitaev.analytical import bdg_block_batched
+
 from .layers import SineLayer
 
 
@@ -307,3 +309,75 @@ class SirenPINN(nn.Module):
         )
 
         return psi_pred
+
+
+class RayleighEnergyAdapter(nn.Module):
+    """Attach a Rayleigh-quotient energy to a model that returns only ``psi``.
+
+    :class:`SirenPINN` returns a single ``2N``-component Nambu-basis
+    eigenvector; the project's evaluation and plotting utilities
+    (:mod:`kitaev.visualisation`) and :class:`kitaev.training.BdGEvaluationProbe`
+    expect a model that returns ``(E_pred, psi_pred)``, as
+    :class:`SirenPINNDualHead` does. This wrapper bridges the two, the
+    Nambu-basis analogue of :class:`kitaev.models.ChiralToBdGAdapter`:
+
+    - ``psi_pred`` is ``model(mu)`` unchanged -- already unit norm.
+    - ``E_pred`` is the Rayleigh quotient
+      ``E_R = psi^T H(mu) psi`` with ``H(mu)`` from
+      :func:`kitaev.analytical.bdg_block_batched`, the same energy estimate
+      :class:`kitaev.training.loss.PinnedFSMLoss` forms internally.
+
+    Unlike :class:`ChiralToBdGAdapter`, ``E_R`` is returned **signed** and
+    no branch canonicalisation is applied: :class:`SirenPINN` +
+    :class:`~kitaev.training.loss.PinnedFSMLoss` has only the soft
+    ``loss_pin`` term selecting ``E_R >= 0``, not an architectural
+    guarantee, so a sign flip or a particle/hole swap in the trivial phase
+    is a genuine property of the baseline model rather than a gauge to be
+    removed here. Consumers that want a non-negative energy (the probe, the
+    energy sweep) take the absolute value themselves.
+
+    Args:
+        model: The wrapped model, returning a ``(batch, 2 * n_sites)``
+            unit-norm eigenvector for a ``mu`` batch.
+        n_sites: Number of physical lattice sites, ``N`` (so the BdG
+            matrix is ``2N x 2N``). This is the physical site count, not
+            ``model.n_sites``, which for :class:`SirenPINN` is the output
+            width ``2N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``. Must match the
+            value the model was trained against.
+        pairing: P-wave pairing amplitude, ``delta``. Must likewise match.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        n_sites: int,
+        hopping: float = 1.0,
+        pairing: float = 0.5,
+    ) -> None:
+        """Wrap a bare-eigenvector model in the dual-head ``(E, psi)`` interface."""
+        super().__init__()
+        self.model = model
+        self.n_sites = n_sites
+        self.hopping = hopping
+        self.pairing = pairing
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(E_pred, psi_pred)`` for the wrapped model.
+
+        Args:
+            x: Chemical-potential values, shape ``(batch_size, in_features)``.
+
+        Returns:
+            A tuple ``(E_pred, psi_pred)`` with ``E_pred`` of shape
+            ``(batch_size, 1)`` (the signed Rayleigh quotient) and
+            ``psi_pred`` of shape ``(batch_size, 2 * n_sites)``.
+        """
+        psi_pred = self.model(x)
+        h_batch = bdg_block_batched(x, self.n_sites, self.hopping, self.pairing)
+        e_pred = torch.einsum("bi,bij,bj->b", psi_pred, h_batch, psi_pred)
+        return e_pred.unsqueeze(-1), psi_pred
