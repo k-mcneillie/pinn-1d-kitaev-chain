@@ -1,4 +1,4 @@
-from .hamiltonian import KitaevChainHamiltonian
+from .hamiltonian import KitaevChainHamiltonian, bdg_block_batched
 from .majorana import (
     chiral_block,
     chiral_block_batched,
@@ -9,6 +9,7 @@ from .majorana import (
 
 __all__ = [
     "KitaevChainHamiltonian",
+    "bdg_block_batched",
     "chiral_block",
     "chiral_block_batched",
     "majorana_basis_change",
