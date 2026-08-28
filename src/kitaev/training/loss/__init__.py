@@ -1,6 +1,7 @@
 from .base import BaseLoss
 from .losses import (
     ChiralFSMLoss,
+    NambuFSMLoss,
     PinnedFSMLoss,
     SemiSupervisedLoss,
     chiral_pointwise_residual,
@@ -9,6 +10,7 @@ from .losses import (
 __all__ = [
     "BaseLoss",
     "PinnedFSMLoss",
+    "NambuFSMLoss",
     "SemiSupervisedLoss",
     "ChiralFSMLoss",
     "chiral_pointwise_residual",
