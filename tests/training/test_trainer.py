@@ -235,6 +235,27 @@ def test_fit_with_val_loader_checkpoints_best_state(
     assert "Loaded best model state from validation" in log_text
 
 
+def test_fit_with_val_loader_and_restore_best_false_records_but_keeps_final(
+    trainer_factory, tiny_loader_factory, kitaev_operators
+) -> None:
+    trainer, session = trainer_factory(
+        config=TrainerConfig(epochs=3, patience=None, restore_best=False)
+    )
+    H_base, H_mu_diag, Xi = kitaev_operators
+    train_loader = tiny_loader_factory(n_samples=4, batch_size=4)
+    val_loader = tiny_loader_factory(n_samples=4, batch_size=4)
+
+    trainer.fit(train_loader, H_base, H_mu_diag, Xi, val_loader=val_loader)
+
+    assert len(trainer.history["val_loss"]) == 3
+    assert trainer._early_stopping.best_epoch is not None
+    assert trainer._early_stopping.best_state is None
+
+    log_text = _read_log(session)
+    assert "Loaded best model state from validation" not in log_text
+    assert "Keeping final-epoch state" in log_text
+
+
 def test_fit_with_scheduler_updates_learning_rate(
     trainer_factory, tiny_loader_factory, kitaev_operators
 ) -> None:
@@ -656,6 +677,35 @@ def test_finalise_model_returns_final_state_when_never_validated(
 
     log_text = _read_log(session)
     assert "Loaded best model state" not in log_text
+
+
+def test_finalise_model_keeps_final_state_when_restore_best_false(
+    trainer_factory,
+) -> None:
+    trainer, session = trainer_factory(
+        config=TrainerConfig(epochs=3, patience=None, restore_best=False)
+    )
+    unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+    pre_call_state = {
+        key: value.clone() for key, value in unwrapped.state_dict().items()
+    }
+    # A validation epoch happened and set the best-loss bookkeeping, but
+    # with restore_best=False no state snapshot was taken.
+    trainer._early_stopping.step(0.1, epoch=2, unwrapped_model=unwrapped)
+    with torch.no_grad():
+        for param in unwrapped.parameters():
+            param.add_(1.0)
+
+    result = trainer._finalise_model()
+
+    for key, value in result.state_dict().items():
+        assert not torch.equal(value, pre_call_state[key])
+    assert trainer._early_stopping.best_epoch == 2
+    assert trainer._early_stopping.best_state is None
+
+    log_text = _read_log(session)
+    assert "Loaded best model state" not in log_text
+    assert "Keeping final-epoch state" in log_text
 
 
 # ---------------------------------------------------------------------------

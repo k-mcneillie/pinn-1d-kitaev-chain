@@ -108,7 +108,9 @@ class UnifiedTrainer:
         self.callbacks = tuple(callbacks)
         self.start_epoch = start_epoch
         self.history = TrainingHistory()
-        self._early_stopping = EarlyStopping(self.config.patience)
+        self._early_stopping = EarlyStopping(
+            self.config.patience, track_state=self.config.restore_best
+        )
 
         # Recorded before accelerator.prepare() wraps ``optimiser`` in an
         # AcceleratedOptimizer, since isinstance checks against the wrapped
@@ -557,9 +559,11 @@ class UnifiedTrainer:
         """Loads the best checkpoint (if any) and returns the unwrapped model.
 
         Returns:
-            The unwrapped model, restored to its best validation-loss
-            state if validation was used, otherwise left at its final
-            training state.
+            The unwrapped model. When ``config.restore_best`` is ``True``
+            and validation ran, this is the lowest-validation-loss state;
+            otherwise it is the final-epoch state. When validation ran
+            but ``restore_best`` is ``False``, the best epoch is logged
+            for provenance but not restored.
         """
         unwrapped_model: nn.Module = self.accelerator.unwrap_model(self.model)
         if self._early_stopping.best_state is not None:
@@ -568,6 +572,12 @@ class UnifiedTrainer:
                 f"Loaded best model state from validation "
                 f"(epoch {self._early_stopping.best_epoch}, "
                 f"val loss: {self._early_stopping.best_loss:.6f})."
+            )
+        elif self._early_stopping.best_epoch is not None:
+            self.session.info(
+                f"Keeping final-epoch state (restore_best=False); best "
+                f"validation loss was {self._early_stopping.best_loss:.6f} "
+                f"at epoch {self._early_stopping.best_epoch}."
             )
         return unwrapped_model
 
