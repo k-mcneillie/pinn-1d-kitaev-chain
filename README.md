@@ -10,7 +10,8 @@ across the model's topological phase transition, using label-free physics
 residuals, exact-diagonalization labels, or a combination of both.
 
 ## Teaser...
-<img width="4471" height="1667" alt="image" src="https://github.com/user-attachments/assets/36ab8044-e799-46da-902d-25f8766195ee" />
+
+<img width="3900" height="1470" alt="seed_fan_chiral" src="https://github.com/user-attachments/assets/da0dde8e-2331-4866-a426-8c4e05977a27" />
 
 ## 1. Introduction
 
