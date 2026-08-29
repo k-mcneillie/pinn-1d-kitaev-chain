@@ -9,6 +9,9 @@ Hamiltonian as a continuous function of the chemical potential, including
 across the model's topological phase transition, using label-free physics
 residuals, exact-diagonalization labels, or a combination of both.
 
+## Teaser...
+<img width="4471" height="1667" alt="image" src="https://github.com/user-attachments/assets/36ab8044-e799-46da-902d-25f8766195ee" />
+
 ## 1. Introduction
 
 The system under study is a parametric family of Hermitian eigenvalue
