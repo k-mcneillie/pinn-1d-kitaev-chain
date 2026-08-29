@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from kitaev.analytical import bdg_block_batched, chiral_block_batched
+from kitaev.analytical import bdg_block_batched, chiral_block_matvec
 
 from . import BaseLoss
 
@@ -446,12 +446,12 @@ class ChiralFSMLoss(BaseLoss):
         del H_base, H_mu_diag, Xi, epoch
 
         u, v = model(mu_batch)
-        h_batch = chiral_block_batched(
-            mu_batch, self.n_sites, self.hopping, self.pairing
+        h_v = chiral_block_matvec(
+            mu_batch, v, hopping=self.hopping, pairing=self.pairing
         )
-
-        h_v = torch.bmm(h_batch, v.unsqueeze(-1)).squeeze(-1)
-        ht_u = torch.bmm(h_batch.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
+        ht_u = chiral_block_matvec(
+            mu_batch, u, hopping=self.hopping, pairing=self.pairing, adjoint=True
+        )
 
         loss_fsm = torch.mean(h_v**2) + torch.mean(ht_u**2)
 
@@ -502,11 +502,13 @@ def chiral_pointwise_residual(
     Returns:
         A tensor of shape ``(batch_size,)`` of non-negative residuals.
     """
-    u, v = model(mu_batch)
-    h_batch = chiral_block_batched(mu_batch, n_sites, hopping, pairing)
+    del n_sites  # inferred from the model output; kept for signature parity
 
-    h_v = torch.bmm(h_batch, v.unsqueeze(-1)).squeeze(-1)
-    ht_u = torch.bmm(h_batch.transpose(1, 2), u.unsqueeze(-1)).squeeze(-1)
+    u, v = model(mu_batch)
+    h_v = chiral_block_matvec(mu_batch, v, hopping=hopping, pairing=pairing)
+    ht_u = chiral_block_matvec(
+        mu_batch, u, hopping=hopping, pairing=pairing, adjoint=True
+    )
     lam = torch.sum(u * h_v, dim=1, keepdim=True)
 
     fsm = (h_v**2).sum(dim=1) + (ht_u**2).sum(dim=1)

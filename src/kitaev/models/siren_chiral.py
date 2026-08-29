@@ -63,8 +63,16 @@ class SirenPINNChiral(nn.Module):
     One caveat: the ``-D`` factor on ``u`` makes ``u`` sign-discontinuous at
     ``mu = 0`` unless ``u(0)`` is supported on odd sites. This is a
     measure-zero global-gauge artefact that does not affect ``E(mu)`` or
-    ``|psi(mu)|^2``; training should simply avoid an epsilon-neighbourhood of
-    ``mu = 0`` (e.g. sample ``mu`` in ``[0.05 t, 4 t]``).
+    ``|psi(mu)|^2``. It compounds a physical fact: at ``mu = 0`` the
+    smallest singular value ``sigma_1 -> 0``, so the folded-spectrum loss
+    ``||h v||^2 + ||h^T u||^2`` and its Rayleigh tie-breaker both vanish and
+    provide no gradient. The model is therefore effectively unconstrained in
+    a small ``|mu| <~ 0.01 t`` band, and a slight residual bump there is
+    expected -- it is a domain-edge degeneracy, not a training failure.
+    Sampling ``mu`` in ``[0.01 t, 4 t]`` keeps that band as narrow as the
+    exact fold allows; a genuinely smooth ``u`` through ``mu = 0`` would
+    need a symmetrised backbone ``f_sym(mu) = 0.5 (f(mu) + T[f(-mu)])``,
+    which is out of scope for this model.
 
     SIREN backbone
     --------------

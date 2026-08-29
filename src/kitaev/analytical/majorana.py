@@ -132,6 +132,65 @@ def chiral_block_batched(
     return block
 
 
+def chiral_block_matvec(
+    mu_batch: torch.Tensor,
+    vec: torch.Tensor,
+    *,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+    adjoint: bool = False,
+) -> torch.Tensor:
+    """Apply the chiral block ``h(mu)`` (or ``h(mu)^T``) without forming it.
+
+    ``h(mu)`` is bidiagonal (see :func:`chiral_block`), so ``h(mu) @ vec`` is
+    a three-term recurrence rather than a dense matrix-vector product. This
+    is the training hot-path counterpart of :func:`chiral_block_batched`: it
+    returns exactly
+
+        torch.bmm(chiral_block_batched(mu_batch, N, hopping, pairing),
+                  vec.unsqueeze(-1)).squeeze(-1)
+
+    (or the same with ``.transpose(1, 2)`` when ``adjoint=True``), but at
+    ``O(batch * N)`` cost and with no ``(batch, N, N)`` allocation or
+    ``bmm``. On accelerators where many small batched matmul / scatter
+    kernels dominate, that difference is most of the per-step cost of a
+    :class:`kitaev.training.loss.ChiralFSMLoss` step. The dense
+    :func:`chiral_block_batched` is kept for probes, analytics and tests.
+
+    With diagonal ``-mu``, super-diagonal ``-(hopping + pairing)`` and
+    sub-diagonal ``-(hopping - pairing)``::
+
+        (h @ x)[n]   = -mu x[n] - (t + d) x[n+1] - (t - d) x[n-1]
+        (h^T @ x)[n] = -mu x[n] - (t - d) x[n+1] - (t + d) x[n-1]
+
+    with out-of-range terms dropped at the chain ends.
+
+    Args:
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)`` or
+            ``(batch_size,)``.
+        vec: Vectors to apply ``h`` to, shape ``(batch_size, n_sites)``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+        adjoint: Apply ``h(mu)^T`` instead of ``h(mu)``.
+
+    Returns:
+        ``h(mu) @ vec`` (or ``h(mu)^T @ vec``), shape
+        ``(batch_size, n_sites)``, on the device and dtype of ``vec``.
+    """
+    mu = mu_batch.reshape(-1, 1)
+
+    zero = vec.new_zeros(vec.shape[0], 1)
+    shift_up = torch.cat([vec[:, 1:], zero], dim=1)  # position n <- vec[n + 1]
+    shift_down = torch.cat([zero, vec[:, :-1]], dim=1)  # position n <- vec[n - 1]
+
+    super_coeff = -(hopping + pairing)
+    sub_coeff = -(hopping - pairing)
+    if adjoint:
+        super_coeff, sub_coeff = sub_coeff, super_coeff
+
+    return -mu * vec + super_coeff * shift_up + sub_coeff * shift_down
+
+
 def resolve_singular_branch(
     u: torch.Tensor,
     v: torch.Tensor,
