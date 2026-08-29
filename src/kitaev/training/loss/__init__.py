@@ -5,6 +5,7 @@ from .losses import (
     PinnedFSMLoss,
     SemiSupervisedLoss,
     chiral_pointwise_residual,
+    nambu_pointwise_residual,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "SemiSupervisedLoss",
     "ChiralFSMLoss",
     "chiral_pointwise_residual",
+    "nambu_pointwise_residual",
 ]

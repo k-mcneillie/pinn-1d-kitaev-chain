@@ -31,6 +31,10 @@ SLATE = "#8d99ae"
 #: Gold, used to mark the chain's two edge sites.
 GOLD = "#e9c46a"
 
+#: Muted ramp for the lowest few exact spectral levels, E_1 darkest. Kept
+#: clear of CORAL so an overlaid model branch stands out against E_1.
+LEVEL_COLOURS = (INK, "#4a5a78", SLATE, "#b8c0d0", GOLD)
+
 #: The palette as a mapping, for callers that would rather look colours up
 #: by name than import the module-level constants.
 PALETTE = {"ink": INK, "coral": CORAL, "teal": TEAL, "slate": SLATE, "gold": GOLD}
@@ -48,7 +52,7 @@ _RC_PARAMS: dict[str, Any] = {
     "axes.spines.top": False,
     "axes.spines.right": False,
     "axes.titlesize": 13,
-    "axes.titleweight": "600",
+    "axes.titleweight": "bold",
     "axes.titlepad": 12,
     "axes.labelsize": 11,
     "axes.labelcolor": INK,
@@ -128,7 +132,7 @@ def annotate_phases(
         "ha": "center",
         "va": "center",
         "fontsize": 9,
-        "weight": "600",
+        "weight": "bold",
     }
     if two_sided:
         ax.text(0.0, y, "topological", color=TEAL, **common)

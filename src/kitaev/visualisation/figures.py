@@ -28,6 +28,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,11 +36,18 @@ from matplotlib.figure import Figure
 
 from kitaev.training.utils import TrainingHistory
 
-from .evaluation import MuReflectionSweep, SpectralSweep, WavefunctionSweep
+from .evaluation import (
+    LowSpectrumSweep,
+    ModelErrorBand,
+    MuReflectionSweep,
+    SpectralSweep,
+    WavefunctionSweep,
+)
 from .style import (
     CORAL,
     GOLD,
     INK,
+    LEVEL_COLOURS,
     SLATE,
     TEAL,
     annotate_phases,
@@ -49,11 +57,29 @@ from .style import (
 )
 
 _COMPONENT_COLOURS = (INK, TEAL, GOLD, CORAL, SLATE)
+_SERIES_COLOURS = (INK, CORAL, TEAL, SLATE)
+_LEVEL_COLOURS = LEVEL_COLOURS
 
 
 def _save(fig: Figure, save_path: str | Path | None, dpi: int) -> None:
     if save_path is not None:
         fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+
+def _rolling_median(y: np.ndarray, window: int = 5) -> np.ndarray:
+    """Odd-window centred rolling median, edges shrinking to fit.
+
+    A per-``mu`` error sweep wiggles by up to an order of magnitude
+    between neighbouring grid points; smoothing the *plotted* median over
+    a few points lets the trivial-vs-topological trend read without
+    touching the underlying data or the band.
+    """
+    if window < 2 or y.size < window:
+        return y
+    half = window // 2
+    return np.array(
+        [np.median(y[max(0, i - half) : i + half + 1]) for i in range(y.size)]
+    )
 
 
 def plot_loss_history(
@@ -62,6 +88,7 @@ def plot_loss_history(
     component_keys: Sequence[str],
     weight_key: str | None = None,
     split_epoch: int | None = None,
+    floor_value: float | None = None,
     total_title: str = "Total loss",
     save_path: str | Path | None = None,
     dpi: int = 300,
@@ -80,6 +107,12 @@ def plot_loss_history(
             drawn on a secondary right-hand axis.
         split_epoch: If given, the AdamW -> L-BFGS hand-over epoch, marked
             on both panels.
+        floor_value: If given, a horizontal reference on the components
+            panel marking the analytic lower bound the folded-spectrum
+            term approaches (see
+            :func:`kitaev.visualisation.evaluation.fsm_convergence_floor`).
+            Makes "flat sits on the line, so it converged rather than
+            stalled" legible.
         total_title: Title for the left panel.
         save_path: If given, the figure is also saved here.
         dpi: Resolution used when saving.
@@ -116,6 +149,14 @@ def plot_loss_history(
             continue
         series = history[series_key]
         axes[1].plot(range(1, len(series) + 1), series, color=colour, lw=1.6, label=key)
+    if floor_value is not None:
+        axes[1].axhline(
+            floor_value,
+            color=SLATE,
+            lw=1.2,
+            ls=(0, (1, 1)),
+            label=r"analytic floor $\langle E_1^2\rangle$",
+        )
     axes[1].set_yscale("log")
     axes[1].set_title("Components")
     axes[1].set_xlabel("epoch")
@@ -420,7 +461,7 @@ def plot_wavefunction_grid(
         "Particle / hole probability density: model vs exact",
         y=1.02,
         fontsize=13,
-        weight="600",
+        weight="bold",
     )
     fig.tight_layout()
     _save(fig, save_path, dpi)
@@ -471,6 +512,391 @@ def plot_mu_reflection(
     ax.set_xlabel(r"$\mu / t$")
     ax.set_ylabel(r"$E$")
     ax.legend(loc="upper left")
+
+    fig.tight_layout()
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_model_comparison(
+    bands: Sequence[ModelErrorBand],
+    *,
+    hopping: float,
+    two_sided: bool = True,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    """Overlay every model's energy error vs ``mu`` plus a trivial/topological bar.
+
+    The headline comparison figure: the left panel makes the
+    trivial-phase gap between the models legible at a glance, the right
+    panel reduces it to two numbers per model with the per-seed spread
+    scattered over the bars.
+
+    Args:
+        bands: One
+            :class:`~kitaev.visualisation.evaluation.ModelErrorBand` per
+            model, all on the same ``mu`` grid.
+        hopping: The hopping amplitude ``t``, for the transition markers.
+        two_sided: Passed to
+            :func:`kitaev.visualisation.style.mark_transition`.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The two-panel figure (error vs ``mu``; MAE bars).
+    """
+    use_house_style()
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.6))
+    colours = list(itertools.islice(itertools.cycle(_SERIES_COLOURS), len(bands)))
+
+    mu_max = max(float(np.abs(b.mu).max()) for b in bands)
+    mark_transition(axes[0], hopping=hopping, mu_max=mu_max, two_sided=two_sided)
+    floor = min(float(b.abs_error_lo[b.abs_error_lo > 0].min()) for b in bands)
+    for band, colour in zip(bands, colours, strict=True):
+        axes[0].fill_between(
+            band.mu,
+            band.abs_error_lo,
+            band.abs_error_hi,
+            color=colour,
+            alpha=0.15,
+            lw=0,
+        )
+        label = f"{band.label} ({band.n_seeds} seeds)"
+        axes[0].plot(
+            band.mu,
+            _rolling_median(band.abs_error_median),
+            color=colour,
+            lw=1.7,
+            label=label,
+        )
+    axes[0].set_yscale("log")
+    axes[0].set_ylim(bottom=max(floor * 0.7, 5e-7))
+    axes[0].set_title(
+        r"$|E_{\rm pred} - E_{\rm exact}|(\mu)$: median, IQR band over seeds"
+    )
+    axes[0].set_xlabel(r"$\mu / t$")
+    axes[0].set_ylabel("absolute energy error")
+    axes[0].legend(loc="upper center", fontsize=9)
+
+    x = np.arange(len(bands))
+    width = 0.38
+    rng = np.random.default_rng(0)
+    for offset, phase, attr in (
+        (-width / 2, "trivial", "mae_trivial"),
+        (+width / 2, "topological", "mae_topological"),
+    ):
+        phase_colour = SLATE if phase == "trivial" else TEAL
+        medians = [float(np.median(getattr(b, attr))) for b in bands]
+        axes[1].bar(
+            x + offset,
+            medians,
+            width,
+            color=phase_colour,
+            alpha=0.5,
+            edgecolor=phase_colour,
+            lw=0.8,
+            label=f"{phase} (median)",
+        )
+        for i, band in enumerate(bands):
+            seeds = np.asarray(getattr(band, attr))
+            jitter = (rng.random(seeds.size) - 0.5) * width * 0.6
+            axes[1].scatter(
+                np.full(seeds.size, x[i] + offset) + jitter,
+                seeds,
+                s=16,
+                color=INK,
+                zorder=3,
+            )
+    axes[1].set_yscale("log")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([b.label for b in bands], rotation=20, ha="right")
+    axes[1].set_ylabel("energy MAE")
+    axes[1].set_title("Energy MAE by phase (points are seeds)")
+    axes[1].legend(fontsize=9)
+
+    fig.tight_layout()
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_wavefunction_waterfall(
+    sweep: WavefunctionSweep,
+    *,
+    hopping: float,
+    model_label: str,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    """Image the particle and hole densities as model, exact and difference.
+
+    Two rows, particle sector then hole sector; three columns, model then
+    exact then ``|model - exact|``. A good Majorana end mode has the two
+    rows matching site by site. The continuous form of the discrete probe
+    columns, and the natural per-``N`` panel for the neural-operator work.
+
+    Args:
+        sweep: A
+            :class:`~kitaev.visualisation.evaluation.WavefunctionSweep`
+            over a dense ``probe_mus`` grid (e.g. from
+            :func:`kitaev.visualisation.evaluation.sweep_wavefunctions`).
+        hopping: The hopping amplitude ``t``, for the transition markers.
+        model_label: Column title for the predicted panels.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The ``(2, 3)``-panel figure.
+    """
+    use_house_style()
+    mu = np.asarray(sweep.probe_mus, dtype=float)
+    n_sites = int(sweep.sites[-1]) + 1
+    extent = (float(mu.min()), float(mu.max()), -0.5, n_sites - 0.5)
+
+    rows = (
+        (r"particle", sweep.particle_pred, sweep.particle_exact),
+        (r"hole", sweep.hole_pred, sweep.hole_exact),
+    )
+    peak = float(
+        max(
+            sweep.particle_pred.max(),
+            sweep.particle_exact.max(),
+            sweep.hole_pred.max(),
+            sweep.hole_exact.max(),
+        )
+    )
+
+    # A robust shared ceiling for the two difference panels: a handful of
+    # single-seed gauge stripes must not wash the colour scale out.
+    diff_peak = float(
+        max(
+            np.percentile(np.abs(sweep.particle_pred - sweep.particle_exact), 99.0),
+            np.percentile(np.abs(sweep.hole_pred - sweep.hole_exact), 99.0),
+        )
+    )
+
+    fig, axes = plt.subplots(
+        2, 3, figsize=(14, 7.2), sharex=True, sharey=True, layout="constrained"
+    )
+    density_images: list[Any] = []
+    diff_images: list[Any] = []
+    for r, (sector, pred, exact) in enumerate(rows):
+        difference = np.abs(pred - exact)
+        panels = (
+            (f"{model_label}", pred, "viridis", 0.0, peak),
+            ("exact", exact, "viridis", 0.0, peak),
+            (
+                r"$|\,$model $-$ exact$\,|$",
+                difference,
+                "magma",
+                0.0,
+                diff_peak,
+            ),
+        )
+        for c, (title, data, cmap, vmin, vmax) in enumerate(panels):
+            ax = axes[r, c]
+            image = ax.imshow(
+                data.T,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
+            )
+            (density_images if c < 2 else diff_images).append(image)
+            ax.grid(False)
+            ax.set_yticks(np.arange(0, n_sites, max(1, n_sites // 5)))
+            for boundary in (-2 * hopping, 2 * hopping):
+                if extent[0] <= boundary <= extent[1]:
+                    ax.axvline(boundary, color="white", ls=(0, (4, 3)), lw=1.0)
+            if r == 0:
+                ax.set_title(title)
+            if r == 1:
+                ax.set_xlabel(r"$\mu / t$")
+        axes[r, 0].set_ylabel(f"{sector}\nsite $n$")
+
+    fig.colorbar(
+        density_images[-1],
+        ax=axes[:, :2].ravel().tolist(),
+        location="right",
+        shrink=0.85,
+        pad=0.015,
+        label=r"$|\psi_n|^2$",
+    )
+    fig.colorbar(
+        diff_images[-1],
+        ax=axes[:, 2].ravel().tolist(),
+        location="right",
+        shrink=0.85,
+        pad=0.015,
+        label=r"absolute density error  $|\Delta\,|\psi_n|^2|$",
+    )
+    fig.suptitle(
+        r"Particle / hole density $|\psi_n(\mu)|^2$", fontsize=13, weight="bold"
+    )
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_pair_density_waterfall(
+    sweep: WavefunctionSweep,
+    *,
+    hopping: float,
+    model_label: str = "model",
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    r"""Image the gauge-invariant pair density
+    :math:`\rho_n(\mu) = |\psi^p_n|^2 + |\psi^h_n|^2`.
+
+    Inside the topological phase the :math:`\pm\sigma_1` pair is
+    near-degenerate, so the individual particle/hole density of one
+    representative is gauge-dependent and not comparable between models.
+    The site-resolved density of the *pair* :math:`\{\psi, \Xi\psi\}` --
+    the diagonal of the projector onto their 2D span -- is
+    gauge-invariant: exactly so for the chiral model, where
+    :math:`\Xi\psi` is structural, and to within the model's own branch
+    error for the Nambu-basis models. This panel is therefore a fair
+    cross-model view where the raw particle/hole waterfall is not.
+
+    Args:
+        sweep: A
+            :class:`~kitaev.visualisation.evaluation.WavefunctionSweep`
+            over a dense ``probe_mus`` grid.
+        hopping: The hopping amplitude ``t``, for the transition markers.
+        model_label: Column title for the predicted panel.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The ``(1, 3)``-panel figure (model, exact, ``|model - exact|``).
+    """
+    use_house_style()
+    mu = np.asarray(sweep.probe_mus, dtype=float)
+    n_sites = int(sweep.sites[-1]) + 1
+    extent = (float(mu.min()), float(mu.max()), -0.5, n_sites - 0.5)
+
+    rho_pred = sweep.particle_pred + sweep.hole_pred
+    rho_exact = sweep.particle_exact + sweep.hole_exact
+    difference = np.abs(rho_pred - rho_exact)
+    peak = float(max(rho_pred.max(), rho_exact.max()))
+    diff_peak = float(np.percentile(difference, 99.0)) or float(difference.max() or 1.0)
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=(14, 4.0), sharex=True, sharey=True, layout="constrained"
+    )
+    panels = (
+        (model_label, rho_pred, "viridis", peak),
+        ("exact", rho_exact, "viridis", peak),
+        (r"$|\,$model $-$ exact$\,|$", difference, "magma", diff_peak),
+    )
+    images: list[Any] = []
+    for ax, (title, data, cmap, vmax) in zip(axes, panels, strict=True):
+        images.append(
+            ax.imshow(
+                data.T,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap=cmap,
+                vmin=0.0,
+                vmax=vmax,
+            )
+        )
+        ax.grid(False)
+        ax.set_yticks(np.arange(0, n_sites, max(1, n_sites // 5)))
+        for boundary in (-2 * hopping, 2 * hopping):
+            if extent[0] <= boundary <= extent[1]:
+                ax.axvline(boundary, color="white", ls=(0, (4, 3)), lw=1.0)
+        ax.set_title(title)
+        ax.set_xlabel(r"$\mu / t$")
+    axes[0].set_ylabel("site $n$")
+
+    fig.colorbar(
+        images[1],
+        ax=list(axes[:2]),
+        location="right",
+        shrink=0.85,
+        pad=0.015,
+        label=r"$\rho_n = |\psi^p_n|^2 + |\psi^h_n|^2$",
+    )
+    fig.colorbar(
+        images[2],
+        ax=[axes[2]],
+        location="right",
+        shrink=0.85,
+        pad=0.015,
+        label=r"absolute error  $|\Delta\rho_n|$",
+    )
+    fig.suptitle(
+        r"Gauge-invariant pair density $\rho_n(\mu)$", fontsize=13, weight="bold"
+    )
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_spectral_fan(
+    low: LowSpectrumSweep,
+    *,
+    hopping: float,
+    predicted: SpectralSweep | None = None,
+    model_label: str = "model",
+    two_sided: bool = True,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    """Plot the lowest exact ``|E_k(mu)|`` levels, optionally with a model branch.
+
+    Shows the ``+-lambda_1`` pair collapsing towards zero inside the
+    topological phase and the bulk gap closing at ``|mu| = 2t`` -- the
+    context for why the topological eigenvector is under-determined.
+
+    Args:
+        low: The result of
+            :func:`kitaev.visualisation.evaluation.sweep_low_spectrum`.
+        hopping: The hopping amplitude ``t``, for the transition markers.
+        predicted: Optional
+            :class:`~kitaev.visualisation.evaluation.SpectralSweep` whose
+            ``energy_pred`` is overlaid as the model's tracked branch.
+        model_label: Legend label for that overlay.
+        two_sided: Passed to
+            :func:`kitaev.visualisation.style.mark_transition`.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The single-axis figure.
+    """
+    use_house_style()
+    fig, ax = plt.subplots(figsize=(9, 4.6))
+    mu_max = float(np.abs(low.mu).max())
+    mark_transition(ax, hopping=hopping, mu_max=mu_max, two_sided=two_sided)
+
+    n_levels = low.levels.shape[1]
+    for k in range(n_levels):
+        colour = _LEVEL_COLOURS[k % len(_LEVEL_COLOURS)]
+        ax.plot(
+            low.mu,
+            low.levels[:, k],
+            color=colour,
+            lw=1.8 if k == 0 else 1.2,
+            label=rf"exact $\sigma_{{{k + 1}}}$",
+        )
+    if predicted is not None:
+        ax.plot(
+            predicted.mu,
+            _rolling_median(predicted.energy_pred),
+            color=CORAL,
+            lw=1.7,
+            ls=(0, (4, 2)),
+            label=f"{model_label} branch",
+        )
+    ax.set_yscale("log")
+    ax.set_title(r"Lowest exact levels $|E_k(\mu)|$")
+    ax.set_xlabel(r"$\mu / t$")
+    ax.set_ylabel(r"$|E_k|$")
+    ax.legend(loc="lower left", fontsize=9, ncol=2)
 
     fig.tight_layout()
     _save(fig, save_path, dpi)
