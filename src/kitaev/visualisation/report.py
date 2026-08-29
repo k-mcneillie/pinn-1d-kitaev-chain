@@ -51,6 +51,7 @@ def save_run_figures(
     component_keys: Sequence[str],
     weight_key: str | None = None,
     split_epoch: int | None = None,
+    floor_value: float | None = None,
     structural_fold: bool = False,
     probe_mus: Sequence[float] | None = None,
     device: torch.device | str = "cpu",
@@ -79,6 +80,10 @@ def save_run_figures(
             ``"pin_wt"``), drawn on a secondary axis of the loss figure.
         split_epoch: AdamW -> L-BFGS hand-over epoch, marked on the loss
             and probe figures when given.
+        floor_value: Analytic folded-spectrum floor for the loss figure's
+            components panel (see
+            :func:`kitaev.visualisation.evaluation.fsm_convergence_floor`);
+            omitted for losses without such a floor.
         structural_fold: Whether the model enforces evenness in ``mu`` by
             construction (changes only the reflection figure's title).
         probe_mus: Override the density-grid ``mu`` columns; defaults to a
@@ -121,6 +126,7 @@ def save_run_figures(
         component_keys=component_keys,
         weight_key=weight_key,
         split_epoch=split_epoch,
+        floor_value=floor_value,
         save_path=paths["loss_history"],
         dpi=dpi,
     )

@@ -8,7 +8,10 @@ import pytest
 from kitaev.analytical import KitaevChainHamiltonian
 from kitaev.models import SirenPINNDualHead
 from kitaev.visualisation.evaluation import (
+    build_model_error_band,
+    fsm_convergence_floor,
     sweep_energy_and_edge_weight,
+    sweep_low_spectrum,
     sweep_mu_reflection,
     sweep_spectrum,
     sweep_wavefunction_grid,
@@ -156,3 +159,63 @@ def test_sweep_mu_reflection_shapes_and_non_negative_diff(dual_head_model) -> No
     assert sweep.energy_neg.shape == (50,)
     assert sweep.mu_half[0] == 0.0 and sweep.mu_half[-1] == pytest.approx(4.0)
     assert sweep.max_abs_diff >= 0.0
+
+
+def test_sweep_low_spectrum_levels_are_distinct_and_match_diagonalisation(
+    hamiltonian,
+) -> None:
+    mu_grid = np.linspace(-3, 3, 9)
+
+    low = sweep_low_spectrum(hamiltonian, mu_grid, n_levels=3)
+
+    assert low.levels.shape == (9, 3)
+    assert low.transition == pytest.approx(2.0)
+    # ascending, non-negative, distinct (the +- pair is folded out)
+    assert np.all(np.diff(low.levels, axis=1) >= -1e-9)
+    assert np.all(low.levels >= 0.0)
+    mid = len(mu_grid) // 2
+    expected = np.linalg.eigvalsh(hamiltonian.build(0.0))[N_SITES : N_SITES + 3]
+    assert low.levels[mid] == pytest.approx(expected)
+    # sigma_1 is far smaller than sigma_2 deep in the topological phase
+    assert low.levels[mid, 0] < 0.1 * low.levels[mid, 1]
+    # and much smaller than sigma_1 out in the trivial phase
+    assert low.levels[mid, 0] < low.levels[0, 0]
+
+
+def test_build_model_error_band_reduces_over_seeds(
+    dual_head_model, hamiltonian
+) -> None:
+    mu_grid = np.linspace(-3, 3, 12)
+    sweeps = [
+        sweep_spectrum(dual_head_model, hamiltonian, mu_grid),
+        sweep_spectrum(dual_head_model, hamiltonian, mu_grid),
+    ]
+
+    band = build_model_error_band("dual", sweeps)
+
+    assert band.n_seeds == 2
+    assert band.mu.shape == band.abs_error_median.shape == (12,)
+    assert np.all(band.abs_error_lo <= band.abs_error_hi + 1e-12)
+    assert len(band.mae_trivial) == len(band.mae_topological) == 2
+    # identical sweeps -> a zero-width band
+    assert band.abs_error_lo == pytest.approx(band.abs_error_hi)
+
+
+def test_build_model_error_band_rejects_empty() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        build_model_error_band("x", [])
+
+
+def test_fsm_convergence_floor_matches_mean_lowest_eigenvalue_squared(
+    hamiltonian,
+) -> None:
+    mu_samples = np.linspace(-4, 4, 21)
+
+    floor = fsm_convergence_floor(hamiltonian, mu_samples)
+    chiral_floor = fsm_convergence_floor(hamiltonian, mu_samples, factor=2.0)
+
+    e1 = np.array(
+        [np.linalg.eigvalsh(hamiltonian.build(float(m)))[N_SITES] for m in mu_samples]
+    )
+    assert floor == pytest.approx(float(np.mean(e1**2)))
+    assert chiral_floor == pytest.approx(2.0 * floor)

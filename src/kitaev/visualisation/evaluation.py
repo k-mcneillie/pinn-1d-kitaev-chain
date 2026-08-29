@@ -118,6 +118,66 @@ class SpectralSweep:
 
 
 @dataclass
+class LowSpectrumSweep:
+    """The lowest few distinct exact levels ``sigma_k(mu)`` across a mu grid.
+
+    The BdG spectrum is ``{+- sigma_k}``, so the ``|E_k|`` come in equal
+    ``+-`` pairs. ``levels`` keeps only the distinct non-negative half:
+    ``sigma_1`` collapses towards zero for ``|mu| < 2t`` (the near-zero
+    edge mode) and ``sigma_2, sigma_3, ...`` are the bulk levels whose gap
+    closes at ``|mu| = 2t``. This is the context for why the topological
+    eigenvector is under-determined.
+
+    Attributes:
+        mu: The mu grid swept over, shape ``(n_points,)``.
+        levels: The ``n_levels`` smallest ``sigma_k`` at each mu,
+            ascending, shape ``(n_points, n_levels)``.
+        transition: The topological transition, ``2 * hopping``.
+    """
+
+    mu: npt.NDArray[np.float64]
+    levels: npt.NDArray[np.float64]
+    transition: float
+
+
+@dataclass
+class ModelErrorBand:
+    """One model's ``|E_pred - E_exact|(mu)`` reduced over its seeds.
+
+    The per-mu curve is summarised as a median with an inter-quartile
+    band. The full inter-seed range is dominated by single-seed,
+    single-mu outliers on a log axis, so the 25th-to-75th percentile band
+    is what the comparison figure shades. The scalar trivial / topological
+    MAEs are kept per seed so a plot can scatter them over the summary
+    bars.
+
+    Attributes:
+        label: Short model name for legends and bar ticks.
+        mu: The shared mu grid, shape ``(n_points,)``.
+        abs_error_median: Median over seeds of ``|E_pred - E_exact|`` at
+            each mu.
+        abs_error_lo: 25th percentile over seeds at each mu.
+        abs_error_hi: 75th percentile over seeds at each mu.
+        mae_trivial: Per-seed mean absolute energy error over ``|mu| >=
+            2t``.
+        mae_topological: Per-seed mean absolute energy error over ``|mu| <
+            2t``.
+        transition: The topological transition, ``2 * hopping``.
+        n_seeds: Number of seeds the band was built from.
+    """
+
+    label: str
+    mu: npt.NDArray[np.float64]
+    abs_error_median: npt.NDArray[np.float64]
+    abs_error_lo: npt.NDArray[np.float64]
+    abs_error_hi: npt.NDArray[np.float64]
+    mae_trivial: list[float]
+    mae_topological: list[float]
+    transition: float
+    n_seeds: int
+
+
+@dataclass
 class MuReflectionSweep:
     """Model spectrum at ``+mu`` vs ``-mu``, to show evenness in ``mu``.
 
@@ -437,6 +497,107 @@ def sweep_wavefunction_grid(
         manifold_density=manifold_density,
         branch=branch,
     )
+
+
+def sweep_low_spectrum(
+    hamiltonian: KitaevChainHamiltonian,
+    mu_grid: npt.NDArray[np.float64],
+    *,
+    n_levels: int = 3,
+) -> LowSpectrumSweep:
+    """Exact-diagonalise over ``mu_grid`` and keep the smallest ``sigma_k``.
+
+    Purely analytical, no model involved. The ``+-`` pairing of the BdG
+    spectrum means the raw ``|E_k|`` are duplicated, so this returns the
+    distinct non-negative half.
+
+    Args:
+        hamiltonian: The exact Hamiltonian to diagonalise at each mu.
+        mu_grid: 1D array of mu values.
+        n_levels: How many of the smallest distinct levels to keep.
+
+    Returns:
+        The populated :class:`LowSpectrumSweep`.
+    """
+    mu_grid = np.asarray(mu_grid, dtype=float)
+    split = hamiltonian.n_sites
+    levels = np.zeros((mu_grid.size, n_levels))
+    for i, mu in enumerate(mu_grid):
+        eigenvalues = np.linalg.eigvalsh(hamiltonian.build(float(mu)))
+        levels[i] = eigenvalues[split : split + n_levels]
+    return LowSpectrumSweep(
+        mu=mu_grid, levels=levels, transition=2.0 * hamiltonian.hopping
+    )
+
+
+def build_model_error_band(
+    label: str,
+    sweeps: Sequence[SpectralSweep],
+) -> ModelErrorBand:
+    """Reduce one model's per-seed :class:`SpectralSweep` set to a band.
+
+    Args:
+        label: Short model name.
+        sweeps: One :class:`SpectralSweep` per seed, all on the same mu
+            grid. Must be non-empty.
+
+    Returns:
+        The populated :class:`ModelErrorBand`.
+
+    Raises:
+        ValueError: If ``sweeps`` is empty.
+    """
+    if not sweeps:
+        raise ValueError("need at least one SpectralSweep to build a band")
+    mu = sweeps[0].mu
+    stack = np.stack([s.abs_error for s in sweeps])  # (n_seeds, n_mu)
+    topological = np.abs(mu) < sweeps[0].transition
+    lo, hi = np.percentile(stack, [25, 75], axis=0)
+    return ModelErrorBand(
+        label=label,
+        mu=mu,
+        abs_error_median=np.median(stack, axis=0),
+        abs_error_lo=lo,
+        abs_error_hi=hi,
+        mae_trivial=[float(s.abs_error[~topological].mean()) for s in sweeps],
+        mae_topological=[float(s.abs_error[topological].mean()) for s in sweeps],
+        transition=sweeps[0].transition,
+        n_seeds=len(sweeps),
+    )
+
+
+def fsm_convergence_floor(
+    hamiltonian: KitaevChainHamiltonian,
+    mu_samples: npt.NDArray[np.float64],
+    *,
+    factor: float = 1.0,
+) -> float:
+    """Analytic lower bound the folded-spectrum loss term approaches.
+
+    ``||H psi||^2`` is minimised over the unit sphere by the lowest state,
+    giving ``E_1(mu)^2``; averaged over the training mu distribution this
+    is the value the ``fsm`` component flattens onto once the energy is
+    right. The chiral loss sums ``||h v||^2 + ||h^T u||^2``, each with the
+    same ``sigma_1(mu)^2 = E_1(mu)^2`` floor, so pass ``factor=2`` there.
+
+    Args:
+        hamiltonian: The exact Hamiltonian.
+        mu_samples: A representative sample of the training mu
+            distribution.
+        factor: Multiplier on ``<E_1(mu)^2>`` (``2`` for the chiral loss,
+            ``1`` for the Nambu folded-spectrum losses).
+
+    Returns:
+        ``factor * mean(E_1(mu)^2)`` over ``mu_samples``.
+    """
+    split_index = hamiltonian.n_sites
+    e1 = np.array(
+        [
+            np.linalg.eigvalsh(hamiltonian.build(float(mu)))[split_index]
+            for mu in np.asarray(mu_samples, dtype=float)
+        ]
+    )
+    return float(factor * np.mean(e1**2))
 
 
 def sweep_mu_reflection(

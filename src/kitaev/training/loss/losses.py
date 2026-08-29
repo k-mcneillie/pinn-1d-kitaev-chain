@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from kitaev.analytical import chiral_block_batched
+from kitaev.analytical import bdg_block_batched, chiral_block_batched
 
 from . import BaseLoss
 
@@ -511,5 +511,52 @@ def chiral_pointwise_residual(
 
     fsm = (h_v**2).sum(dim=1) + (ht_u**2).sum(dim=1)
     var = ((h_v - lam * u) ** 2).sum(dim=1) + ((ht_u - lam * v) ** 2).sum(dim=1)
+    residual: torch.Tensor = fsm + var
+    return residual
+
+
+def nambu_pointwise_residual(
+    model: torch.nn.Module,
+    mu_batch: torch.Tensor,
+    n_sites: int,
+    *,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+) -> torch.Tensor:
+    """Per-sample Nambu-basis eigen-residual, the counterpart of the chiral one.
+
+    This is the quantity :class:`NambuFSMLoss` averages into a scalar, kept
+    **per mu** so it can drive residual-adaptive sampling or serve as a
+    difficulty map for the interpretability pipeline::
+
+        residual(mu) = ||H(mu) psi||^2 + ||H(mu) psi - E_R psi||^2
+
+    with ``psi`` the model output at ``mu`` and ``E_R = psi^T H(mu) psi`` the
+    Rayleigh quotient. ``H(mu)`` is rebuilt from ``mu_batch`` via
+    :func:`kitaev.analytical.bdg_block_batched`, so no ``(H_base, H_mu_diag)``
+    pair has to be threaded through.
+
+    Args:
+        model: A model returning a ``(batch_size, 2 * n_sites)`` unit-norm
+            Nambu eigenvector for a mu batch, e.g.
+            :class:`kitaev.models.SirenPINN` or
+            :class:`kitaev.models.SirenPINNNambuFolded`. A dual-head model
+            must be wrapped so its ``forward`` returns only ``psi``.
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)``.
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+
+    Returns:
+        A tensor of shape ``(batch_size,)`` of non-negative residuals.
+    """
+    psi = model(mu_batch)
+    h_batch = bdg_block_batched(mu_batch, n_sites, hopping, pairing)
+
+    h_psi = torch.bmm(h_batch, psi.unsqueeze(-1)).squeeze(-1)
+    e_rayleigh = torch.sum(psi * h_psi, dim=1, keepdim=True)
+
+    fsm = (h_psi**2).sum(dim=1)
+    var = ((h_psi - e_rayleigh * psi) ** 2).sum(dim=1)
     residual: torch.Tensor = fsm + var
     return residual
