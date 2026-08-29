@@ -64,6 +64,10 @@ class TrainingHistory:
     def __contains__(self, key: str) -> bool:
         return key in self._series
 
+    def get(self, key: str, default: list[float] | None = None) -> list[float]:
+        """Returns the named series, or ``default`` (else ``[]``) if absent."""
+        return self._series.get(key, [] if default is None else default)
+
     def as_dict(self) -> dict[str, list[float]]:
         """Returns a plain dict copy of the full history, e.g. for plotting."""
         return dict(self._series)
@@ -79,14 +83,21 @@ class EarlyStopping:
     Attributes:
         patience: Epochs without improvement before stopping is
             signalled. ``None`` disables stopping.
+        track_state: When ``True`` the best epoch's model state dict is
+            deep-copied into ``best_state`` so the trainer can roll back
+            to it. When ``False`` only ``best_loss`` and ``best_epoch``
+            are tracked (for logging and provenance) and ``best_state``
+            stays ``None``, avoiding the per-improvement copy when the
+            caller has opted out of best-checkpoint restoration.
         best_loss: Lowest validation loss observed so far.
         best_epoch: Epoch at which ``best_loss`` was recorded.
         best_state: Deep-copied, unwrapped model state dict at
-            ``best_epoch``.
+            ``best_epoch``, or ``None`` when ``track_state`` is ``False``.
     """
 
-    def __init__(self, patience: int | None) -> None:
+    def __init__(self, patience: int | None, *, track_state: bool = True) -> None:
         self.patience = patience
+        self.track_state = track_state
         self.best_loss: float = float("inf")
         self.best_epoch: int | None = None
         self.best_state: dict[str, torch.Tensor] | None = None
@@ -111,7 +122,8 @@ class EarlyStopping:
         if val_loss < self.best_loss:
             self.best_loss = val_loss
             self.best_epoch = epoch
-            self.best_state = copy.deepcopy(unwrapped_model.state_dict())
+            if self.track_state:
+                self.best_state = copy.deepcopy(unwrapped_model.state_dict())
             self._epochs_without_improvement = 0
         else:
             self._epochs_without_improvement += 1

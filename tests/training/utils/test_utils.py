@@ -46,6 +46,14 @@ class TestTrainingHistory:
         assert as_dict == {"train_loss": [1.0]}
         assert as_dict is not history._series
 
+    def test_get_returns_series_or_default(self) -> None:
+        history = TrainingHistory()
+        history.record("train_loss", 1.0)
+
+        assert history.get("train_loss") == [1.0]
+        assert history.get("val_loss") == []
+        assert history.get("val_loss", [9.0]) == [9.0]
+
 
 class TestEarlyStopping:
     def test_first_call_is_always_recorded_as_best(self) -> None:
@@ -99,3 +107,21 @@ class TestEarlyStopping:
 
         assert torch.equal(early_stopping.best_state["weight"], original_weight)
         assert not torch.equal(early_stopping.best_state["weight"], model.weight)
+
+    def test_track_state_false_records_best_without_snapshotting(self) -> None:
+        early_stopping = EarlyStopping(patience=2, track_state=False)
+        model = torch.nn.Linear(1, 1)
+
+        early_stopping.step(5.0, epoch=1, unwrapped_model=model)
+        early_stopping.step(2.0, epoch=2, unwrapped_model=model)
+
+        assert early_stopping.best_loss == 2.0
+        assert early_stopping.best_epoch == 2
+        assert early_stopping.best_state is None
+
+    def test_track_state_false_still_signals_stop_on_patience(self) -> None:
+        early_stopping = EarlyStopping(patience=1, track_state=False)
+        model = torch.nn.Linear(1, 1)
+
+        assert early_stopping.step(1.0, epoch=1, unwrapped_model=model) is False
+        assert early_stopping.step(2.0, epoch=2, unwrapped_model=model) is True

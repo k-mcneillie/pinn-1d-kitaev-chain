@@ -19,12 +19,22 @@ class TrainerConfig:
             stopping entirely.
         grad_clip_norm: Maximum gradient norm for clipping on standard
             (non-L-BFGS) optimiser steps. ``None`` disables clipping.
+        restore_best: When ``True`` (the default) and a validation loader
+            is used, the model returned by ``fit`` is rolled back to the
+            state that had the lowest validation loss. When ``False`` the
+            final-epoch state is returned instead, and the best epoch is
+            only recorded, not restored. Set ``False`` for fixed-budget
+            training where a plateaued validation loss (the folded
+            spectrum loss has a floor of the energy squared) would
+            otherwise freeze the model while the eigenvector is still
+            sharpening.
     """
 
     epochs: int = 3000
     print_freq: int = 500
     patience: int | None = None
     grad_clip_norm: float | None = 1.0
+    restore_best: bool = True
 
 
 @dataclass
