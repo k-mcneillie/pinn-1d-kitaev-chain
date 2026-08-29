@@ -9,6 +9,8 @@ import torch
 from kitaev.analytical import (
     KitaevChainHamiltonian,
     chiral_block,
+    chiral_block_batched,
+    chiral_block_matvec,
     majorana_basis_change,
     reconstruct_bdg_eigenvector,
     resolve_singular_branch,
@@ -61,6 +63,54 @@ class TestChiralBlock(TestCase):
             h_plus = chiral_block(mu, n_sites, T, DELTA)
             h_minus = chiral_block(-mu, n_sites, T, DELTA)
             self.assertTrue(np.allclose(h_minus, -d_mat @ h_plus @ d_mat))
+
+
+class TestChiralBlockMatvec(TestCase):
+    """chiral_block_matvec is the matrix-free equivalent of the dense bmm."""
+
+    def _dense_apply(
+        self, mu_batch: torch.Tensor, vec: torch.Tensor, *, adjoint: bool
+    ) -> torch.Tensor:
+        n_sites = vec.shape[1]
+        h = chiral_block_batched(mu_batch, n_sites, T, DELTA)
+        if adjoint:
+            h = h.transpose(1, 2)
+        return torch.bmm(h, vec.unsqueeze(-1)).squeeze(-1)
+
+    def test_matches_dense_bmm(self):
+        """h(mu) @ v and h(mu)^T @ u match the dense product across shapes."""
+        torch.manual_seed(0)
+        for n_sites in (1, 2, 5, 20):
+            mu_batch = (torch.rand(17, 1, dtype=torch.float64) * 8.0) - 4.0
+            for adjoint in (False, True):
+                vec = torch.randn(17, n_sites, dtype=torch.float64)
+                got = chiral_block_matvec(
+                    mu_batch, vec, hopping=T, pairing=DELTA, adjoint=adjoint
+                )
+                want = self._dense_apply(mu_batch, vec, adjoint=adjoint)
+                self.assertTrue(torch.allclose(got, want, atol=1e-12))
+
+    def test_accepts_flat_mu(self):
+        """A 1-D mu batch is handled the same as a column vector."""
+        mu_flat = torch.linspace(-4.0, 4.0, 9, dtype=torch.float64)
+        vec = torch.randn(9, 6, dtype=torch.float64)
+        col = chiral_block_matvec(mu_flat[:, None], vec, hopping=T, pairing=DELTA)
+        flat = chiral_block_matvec(mu_flat, vec, hopping=T, pairing=DELTA)
+        self.assertTrue(torch.allclose(col, flat, atol=1e-12))
+
+    def test_gradient_matches_dense(self):
+        """d/dmu of the matvec agrees with the dense path (autograd parity)."""
+        mu_dense = torch.tensor([[0.3], [1.7], [2.4]], requires_grad=True)
+        mu_free = mu_dense.detach().clone().requires_grad_(True)
+        vec = torch.randn(3, 8)
+
+        dense = self._dense_apply(mu_dense, vec, adjoint=False)
+        free = chiral_block_matvec(mu_free, vec, hopping=T, pairing=DELTA)
+        dense.pow(2).sum().backward()
+        free.pow(2).sum().backward()
+
+        assert mu_dense.grad is not None and mu_free.grad is not None
+        self.assertTrue(torch.allclose(mu_dense.grad, mu_free.grad, atol=1e-6))
 
 
 class TestMajoranaBasisChange(TestCase):
