@@ -10,7 +10,7 @@ import numpy as np
 from kitaev.analytical import KitaevChainHamiltonian
 from kitaev.models import ChiralToBdGAdapter, SirenPINNChiral
 from kitaev.training.utils import TrainingHistory
-from kitaev.visualisation.report import save_run_figures
+from kitaev.visualisation.report import rerender_wavefunctions, save_run_figures
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -89,4 +89,20 @@ def test_save_run_figures_skips_probe_history_without_probe_series(
 
     assert "probe_history" not in paths
     assert (tmp_path / "figs" / "energy_sweep.png").exists()
+    plt.close("all")
+
+
+def test_rerender_wavefunctions_writes_only_the_density_figure(tmp_path: Path) -> None:
+    hamiltonian = KitaevChainHamiltonian(n_sites=N_SITES, hopping=1.0, pairing=0.5)
+
+    path = rerender_wavefunctions(
+        adapter=_adapter(),
+        hamiltonian=hamiltonian,
+        out_dir=tmp_path / "seed_0",
+        two_sided=True,
+    )
+
+    assert path == tmp_path / "seed_0" / "wavefunctions.png"
+    assert path.exists() and path.stat().st_size > 0
+    assert list((tmp_path / "seed_0").iterdir()) == [path]
     plt.close("all")
