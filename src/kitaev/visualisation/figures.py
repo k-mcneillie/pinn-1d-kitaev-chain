@@ -398,9 +398,11 @@ def plot_wavefunction_grid(
 ) -> Figure:
     """Plot particle/hole density profiles at each probe ``mu``, model vs exact.
 
-    Two rows (particle, hole) by one column per probe ``mu``. Where
-    ``sweep.manifold_density`` is defined (topological ``mu``), the
-    gauge-invariant ``rho / 2`` is overlaid.
+    Two rows (particle, hole) by one column per probe ``mu``. In the
+    topological columns (tagged ``rho/2``) both curves are already the
+    gauge-invariant pair density -- a single eigenvector of the
+    near-degenerate ``+-lambda_1`` pair is an arbitrary, often one-sided,
+    member of the doublet -- so no separate overlay is needed.
 
     Args:
         sweep: A :class:`~kitaev.visualisation.evaluation.WavefunctionSweep`,
@@ -435,22 +437,13 @@ def plot_wavefunction_grid(
             ax.fill_between(sites, exact[col], color=INK, alpha=0.12, lw=0)
             ax.plot(sites, exact[col], color=INK, lw=1.8, label="exact")
             ax.plot(sites, pred[col], color=CORAL, lw=1.5, ls=(0, (3, 2)), label="PINN")
-            if (
-                sweep.manifold_density is not None
-                and not np.isnan(sweep.manifold_density[col, row]).any()
-            ):
-                ax.plot(
-                    sites,
-                    sweep.manifold_density[col, row] / 2.0,
-                    color=TEAL,
-                    lw=1.3,
-                    ls=(0, (1, 1)),
-                    label=r"$\rho/2$",
-                )
             for edge in (int(sites[0]), int(sites[-1])):
                 ax.axvline(edge, color=GOLD, lw=1.0, alpha=0.6)
             if row == 0:
-                ax.set_title(rf"$\mu = {mu:+.1f}\,t$", color=tag_colour)
+                title = rf"$\mu = {mu:+.1f}\,t$"
+                if is_topological:
+                    title += r"  ($\rho/2$)"
+                ax.set_title(title, color=tag_colour)
             if col == 0:
                 ax.set_ylabel(rf"$|\psi_n|^2$  ({label})")
             if row == 1:
@@ -634,6 +627,11 @@ def plot_wavefunction_waterfall(
     exact then ``|model - exact|``. A good Majorana end mode has the two
     rows matching site by site. The continuous form of the discrete probe
     columns, and the natural per-``N`` panel for the neural-operator work.
+
+    In the topological band (``|mu| < 2t``) both the model and the exact
+    panels show the gauge-invariant pair density ``rho/2`` rather than a
+    single arbitrary eigenvector of the near-degenerate ``+-lambda_1``
+    pair (see :func:`~kitaev.visualisation.evaluation.sweep_wavefunctions`).
 
     Args:
         sweep: A

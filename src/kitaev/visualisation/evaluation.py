@@ -48,17 +48,24 @@ class WavefunctionSweep:
     Attributes:
         probe_mus: The mu values probed.
         sites: Physical site indices, shape ``(n_sites,)``.
-        particle_exact: Exact particle-sector ``|psi_n|^2``, shape
-            ``(len(probe_mus), n_sites)``.
-        hole_exact: Exact hole-sector ``|psi_n|^2``, same shape.
-        particle_pred: Model particle-sector ``|psi_n|^2``, same shape.
-        hole_pred: Model hole-sector ``|psi_n|^2``, same shape.
+        particle_exact: Reference particle-sector density, shape
+            ``(len(probe_mus), n_sites)``. Trivial phase (``|mu| >= 2t``):
+            ``|psi_n|^2`` of the single lowest non-negative ``eigh``
+            eigenvector. Topological phase (``|mu| < 2t``): the
+            gauge-invariant pair density ``rho/2``, since a single
+            eigenvector of the near-degenerate ``+-lambda_1`` pair is an
+            arbitrary member of the doublet.
+        hole_exact: Reference hole-sector density, same convention.
+        particle_pred: Model particle-sector density, same convention (the
+            projector diagonal of ``span{psi, Xi psi}`` halved, in the
+            topological phase).
+        hole_pred: Model hole-sector density, same convention.
         manifold_density: Optional gauge-invariant near-zero manifold
-            density ``rho(n) = |psi_+(n)|^2 + |psi_-(n)|^2`` split into
-            ``[particle, hole]`` halves, shape ``(len(probe_mus), 2,
-            n_sites)``. Rows for trivial-phase mu values (where the
-            ``+-lambda_1`` pair is not degenerate) are ``np.nan``. ``None``
-            when the sweep did not compute it (see
+            density ``rho(n) = |psi_+(n)|^2 + |psi_-(n)|^2`` (un-halved)
+            split into ``[particle, hole]`` halves, shape
+            ``(len(probe_mus), 2, n_sites)``. Rows for trivial-phase mu
+            values (where the ``+-lambda_1`` pair is not degenerate) are
+            ``np.nan``. ``None`` when the sweep did not compute it (see
             :func:`sweep_wavefunction_grid`).
         branch: Optional per-mu record of whether the raw model eigenvector
             was kept (``"keep"``) or particle/hole-swapped (``"Xi-flip"``)
@@ -271,6 +278,47 @@ def sweep_energy_and_edge_weight(
     )
 
 
+def _near_zero_pair_density(
+    eigenvalues: npt.NDArray[np.float64],
+    eigenvectors: npt.NDArray[np.float64],
+    n_sites: int,
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Particle/hole projector diagonals of the 2D near-zero eigenspace.
+
+    ``rho_sector(n) = sum_{k in {-lambda_1, +lambda_1}} |psi_k(n)|^2`` for
+    that sector, from the two smallest-``|E|`` exact eigenvectors. Unlike
+    either eigenvector on its own this is invariant to any rotation within
+    the (near-)degenerate pair, so it is well defined even where ``eigh``
+    hands back an arbitrary basis of the doublet -- which it routinely
+    does inside the topological phase, where the ``+-lambda_1`` splitting
+    falls below machine precision and a single column comes out an
+    arbitrary, often one-sided, Majorana combination. Each returned array
+    sums to ~1; the two together sum to ~2.
+    """
+    near = eigenvectors[:, np.argsort(np.abs(eigenvalues))[:2]]
+    return (near[:n_sites, :] ** 2).sum(axis=1), (near[n_sites:, :] ** 2).sum(axis=1)
+
+
+def _predicted_pair_density(
+    psi_pred: npt.NDArray[np.float64], n_sites: int
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Model counterpart of :func:`_near_zero_pair_density`.
+
+    The projector diagonal of ``span{psi, Xi psi}`` (``Xi`` the
+    particle-hole swap), Gram-Schmidt orthonormalised. ``{psi, Xi psi}``
+    spans the model's near-zero 2D subspace -- exactly for the chiral
+    model where ``Xi psi`` is structural, to within its branch error for
+    the Nambu-basis models -- so it is gauge-invariant in the same sense.
+    Each returned array sums to ~1; the two together sum to ~2.
+    """
+    u1 = psi_pred / (np.linalg.norm(psi_pred) + 1e-30)
+    u2 = np.concatenate([u1[n_sites:], u1[:n_sites]])
+    u2 = u2 - (u1 @ u2) * u1
+    norm = np.linalg.norm(u2)
+    u2 = u2 / norm if norm > 1e-9 else np.zeros_like(u2)
+    return u1[:n_sites] ** 2 + u2[:n_sites] ** 2, u1[n_sites:] ** 2 + u2[n_sites:] ** 2
+
+
 def sweep_wavefunctions(
     model: torch.nn.Module,
     hamiltonian: KitaevChainHamiltonian,
@@ -279,6 +327,15 @@ def sweep_wavefunctions(
     device: torch.device | str = "cpu",
 ) -> WavefunctionSweep:
     """Compares particle/hole probability density profiles at chosen mu values.
+
+    Outside the topological phase the reference is the single lowest
+    non-negative ``eigh`` eigenvector and the prediction is its raw
+    density. Inside it (``|mu| < 2t``) the ``+-lambda_1`` pair is
+    (near-)degenerate, so a single eigenvector is an arbitrary member of
+    the doublet; both sides are then the gauge-invariant pair density
+    ``rho/2`` -- :func:`_near_zero_pair_density` for the reference,
+    :func:`_predicted_pair_density` for the model -- which is the density
+    a balanced energy eigenstate carries and is comparable between models.
 
     Args:
         model: A trained dual-head model, as in
@@ -294,30 +351,42 @@ def sweep_wavefunctions(
     n_sites = hamiltonian.n_sites
     split_index = n_sites
     sites = np.arange(n_sites)
-
-    particle_exact = np.zeros((len(probe_mus), n_sites))
-    hole_exact = np.zeros((len(probe_mus), n_sites))
-    for i, mu in enumerate(probe_mus):
-        _, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
-        psi = eigenvectors[:, split_index]
-        particle_exact[i] = psi[:n_sites] ** 2
-        hole_exact[i] = psi[n_sites:] ** 2
+    transition = 2.0 * hamiltonian.hopping
 
     model.eval()
     with torch.no_grad():
         mu_tensor = torch.tensor(
             [[mu] for mu in probe_mus], dtype=torch.float32, device=device
         )
-        _, psi_pred_t = model(mu_tensor)
-        prob_pred = (psi_pred_t**2).cpu().numpy()
+        psi_pred = model(mu_tensor)[1].detach().cpu().numpy()
+
+    particle_exact = np.zeros((len(probe_mus), n_sites))
+    hole_exact = np.zeros((len(probe_mus), n_sites))
+    particle_pred = np.zeros((len(probe_mus), n_sites))
+    hole_pred = np.zeros((len(probe_mus), n_sites))
+    for i, mu in enumerate(probe_mus):
+        eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
+        if abs(mu) < transition:
+            rho_p, rho_h = _near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
+            particle_exact[i] = rho_p / 2.0
+            hole_exact[i] = rho_h / 2.0
+            pred_p, pred_h = _predicted_pair_density(psi_pred[i], n_sites)
+            particle_pred[i] = pred_p / 2.0
+            hole_pred[i] = pred_h / 2.0
+        else:
+            psi = eigenvectors[:, split_index]
+            particle_exact[i] = psi[:n_sites] ** 2
+            hole_exact[i] = psi[n_sites:] ** 2
+            particle_pred[i] = psi_pred[i, :n_sites] ** 2
+            hole_pred[i] = psi_pred[i, n_sites:] ** 2
 
     return WavefunctionSweep(
         probe_mus=list(probe_mus),
         sites=sites,
         particle_exact=particle_exact,
         hole_exact=hole_exact,
-        particle_pred=prob_pred[:, :n_sites],
-        hole_pred=prob_pred[:, n_sites:],
+        particle_pred=particle_pred,
+        hole_pred=hole_pred,
     )
 
 
@@ -413,21 +482,25 @@ def sweep_wavefunction_grid(
 ) -> WavefunctionSweep:
     """Probe wavefunctions at chosen mu values, with branch alignment and rho.
 
-    Extends :func:`sweep_wavefunctions` with the two pieces the standard
+    Extends :func:`sweep_wavefunctions` with the record the standard
     density figure needs beyond a raw exact-vs-model overlay:
 
-    - **Branch alignment.** A model whose ``+-E`` branch is only a gauge
-      (no ``loss_pin``, no structural resolver) can settle on ``Xi psi``
-      in the trivial phase -- particle and hole sectors swapped relative
-      to ``eigh``'s column. For each trivial-phase mu, whichever of
-      ``{psi, Xi psi}`` better overlaps the reference is kept before the
-      split into sectors. Topological columns are left raw (a ``Xi`` flip
-      is nearly a no-op on their density, and they only ever illustrate one
-      arbitrary section of the degenerate manifold).
-    - **Manifold density.** For topological mu values, the gauge-invariant
-      ``rho(n) = |psi_+(n)|^2 + |psi_-(n)|^2`` from the two smallest-``|E|``
-      eigenvectors, so the figure can show ``rho / 2`` -- the density a
-      balanced energy eigenstate would have.
+    - **Trivial phase (``|mu| >= 2t``).** Reference is the single lowest
+      non-negative ``eigh`` eigenvector. A model whose ``+-E`` branch is
+      only a gauge (no ``loss_pin``, no structural resolver) can settle on
+      ``Xi psi`` here -- particle and hole sectors swapped relative to
+      ``eigh``'s column -- so whichever of ``{psi, Xi psi}`` better
+      overlaps the reference is kept before the split into sectors, and
+      ``branch`` records which.
+    - **Topological phase (``|mu| < 2t``).** The ``+-lambda_1`` pair is
+      (near-)degenerate, so a single eigenvector is an arbitrary,
+      frequently one-sided, member of the doublet. Both ``*_exact`` and
+      ``*_pred`` are the gauge-invariant pair density ``rho/2`` instead
+      (:func:`_near_zero_pair_density` / :func:`_predicted_pair_density`)
+      -- the density a balanced energy eigenstate carries. ``branch`` is
+      ``"keep"`` for these columns (no flip is applied). ``manifold_density``
+      additionally carries the un-halved ``rho(n) = |psi_+(n)|^2 +
+      |psi_-(n)|^2`` split into ``[particle, hole]`` halves.
 
     Args:
         model: A trained model (or adapter) returning ``(E_pred,
@@ -464,28 +537,31 @@ def sweep_wavefunction_grid(
 
     for col, mu in enumerate(probe_mus):
         eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
+        psi = psi_pred_all[col]
+
+        if abs(mu) < transition:
+            rho_p, rho_h = _near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
+            manifold_density[col, 0] = rho_p
+            manifold_density[col, 1] = rho_h
+            particle_exact[col] = rho_p / 2.0
+            hole_exact[col] = rho_h / 2.0
+            pred_p, pred_h = _predicted_pair_density(psi, n_sites)
+            particle_pred[col] = pred_p / 2.0
+            hole_pred[col] = pred_h / 2.0
+            branch.append("keep")
+            continue
+
         psi_ref = eigenvectors[:, split_index]
         particle_exact[col] = psi_ref[:n_sites] ** 2
         hole_exact[col] = psi_ref[n_sites:] ** 2
-
-        psi = psi_pred_all[col]
         psi_xi = np.concatenate([psi[n_sites:], psi[:n_sites]])
-        if (
-            branch_align
-            and abs(mu) >= transition
-            and abs(psi_xi @ psi_ref) > abs(psi @ psi_ref)
-        ):
+        if branch_align and abs(psi_xi @ psi_ref) > abs(psi @ psi_ref):
             psi = psi_xi
             branch.append("Xi-flip")
         else:
             branch.append("keep")
         particle_pred[col] = psi[:n_sites] ** 2
         hole_pred[col] = psi[n_sites:] ** 2
-
-        if abs(mu) < transition:
-            near = eigenvectors[:, np.argsort(np.abs(eigenvalues))[:2]]
-            manifold_density[col, 0] = (near[:n_sites, :] ** 2).sum(axis=1)
-            manifold_density[col, 1] = (near[n_sites:, :] ** 2).sum(axis=1)
 
     return WavefunctionSweep(
         probe_mus=list(probe_mus),

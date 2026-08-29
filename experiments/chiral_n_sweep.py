@@ -24,6 +24,7 @@ in ``four_model_comparison.py --budget-sweep``; the point is the trend in
 
     python experiments/chiral_n_sweep.py
     python experiments/chiral_n_sweep.py --n-values 10 20 40 --seeds 0 1 2
+    python experiments/chiral_n_sweep.py --figures-only results/logs/<session>
 """
 
 from __future__ import annotations
@@ -53,7 +54,11 @@ from kitaev.training.config import TrainerConfig
 from kitaev.training.loss import ChiralFSMLoss, NambuFSMLoss
 from kitaev.training.sampling import SamplingConfig, build_sampling
 from kitaev.training.trainer import _build_kitaev_operators
-from kitaev.visualisation import fsm_convergence_floor, save_run_figures
+from kitaev.visualisation import (
+    fsm_convergence_floor,
+    rerender_wavefunctions,
+    save_run_figures,
+)
 
 T = 1.0
 DELTA = 0.5
@@ -309,8 +314,67 @@ def summarise(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _rebuild_adapter(kind: str, n_sites: int, checkpoint: Path) -> Any:
+    """Load one ``seed_*.pt`` for ``(kind, n_sites)`` into its (E, psi) adapter."""
+    if kind == "chiral":
+        model: torch.nn.Module = SirenPINNChiral(
+            n_sites=n_sites, hidden_features=64, hidden_layers=2, input_scale=4.0
+        )
+    else:
+        model = SirenPINNNambuFolded(
+            n_sites=2 * n_sites, hidden_features=64, hidden_layers=2, input_scale=4.0
+        )
+    model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+    model.eval()
+    if kind == "chiral":
+        return ChiralToBdGAdapter(model, hopping=T, pairing=DELTA)
+    return RayleighEnergyAdapter(model, n_sites=n_sites, hopping=T, pairing=DELTA)
+
+
+def render_figures_only(session_dir: Path) -> list[Path]:
+    """Re-render the per-seed ``wavefunctions.png`` from a finished sweep's checkpoints.
+
+    Only the density figure is refreshed: it is the one that consumes
+    ``sweep_wavefunction_grid``, and the training history the rest of the
+    standard set needs is not checkpointed. Every
+    ``figures/<kind>/N<n>/seed_<s>/`` directory with a matching checkpoint
+    is rewritten in place.
+    """
+    two_sided = bool(MU_GRID.min() < 0)
+    written: list[Path] = []
+    for kind in ("chiral", "structural_nambu"):
+        for ckpt in sorted((session_dir / "checkpoints" / kind).glob("N*/seed_*.pt")):
+            n_sites = int(ckpt.parent.name[1:])
+            out_dir = session_dir / "figures" / kind / ckpt.parent.name / ckpt.stem
+            if not out_dir.is_dir():
+                continue
+            adapter = _rebuild_adapter(kind, n_sites, ckpt)
+            hamiltonian = KitaevChainHamiltonian(
+                n_sites=n_sites, hopping=T, pairing=DELTA
+            )
+            written.append(
+                rerender_wavefunctions(
+                    adapter=adapter,
+                    hamiltonian=hamiltonian,
+                    out_dir=out_dir,
+                    two_sided=two_sided,
+                )
+            )
+    return written
+
+
 def main() -> list[dict[str, Any]]:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--figures-only",
+        type=Path,
+        default=None,
+        metavar="SESSION_DIR",
+        help=(
+            "skip training; re-render just the per-seed wavefunctions.png in "
+            "this session directory from its checkpoints"
+        ),
+    )
     parser.add_argument("--n-values", nargs="+", type=int, default=[10, 20, 40])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument(
@@ -327,6 +391,13 @@ def main() -> list[dict[str, Any]]:
     )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
+
+    if args.figures_only is not None:
+        written = render_figures_only(args.figures_only)
+        for path in written:
+            print(f"wavefunctions  {path}")
+        print(f"re-rendered {len(written)} density figures")
+        return []
 
     session = Session(
         name="chiral-n-sweep",

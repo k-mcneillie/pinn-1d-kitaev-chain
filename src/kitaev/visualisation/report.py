@@ -165,3 +165,49 @@ def save_run_figures(
 
     plt.close("all")
     return paths
+
+
+def rerender_wavefunctions(
+    *,
+    adapter: torch.nn.Module,
+    hamiltonian: KitaevChainHamiltonian,
+    out_dir: str | Path,
+    two_sided: bool = True,
+    probe_mus: Sequence[float] | None = None,
+    device: torch.device | str = "cpu",
+    dpi: int = 300,
+) -> Path:
+    """Re-render only ``wavefunctions.png`` for a finished run, from its checkpoint.
+
+    :func:`save_run_figures` needs the training ``history`` for the loss and
+    probe panels, which is not checkpointed. This renders just the density
+    figure -- the one that consumes
+    :func:`kitaev.visualisation.evaluation.sweep_wavefunction_grid` -- so
+    the ``--figures-only`` paths of the experiment scripts can refresh it
+    against runs already on disk when that sweep changes (e.g. the
+    gauge-invariant topological-phase reference).
+
+    Args:
+        adapter: A model or adapter returning ``(E_pred, psi_pred)``.
+        hamiltonian: The exact Hamiltonian the model was trained against.
+        out_dir: The per-seed figure directory to write into.
+        two_sided: Whether the run's ``mu`` grid crossed zero; picks the
+            default probe-mu columns to match :func:`save_run_figures`.
+        probe_mus: Explicit probe-mu columns, overriding ``two_sided``.
+        device: Device for the model forward pass.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The path ``wavefunctions.png`` was written to.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if probe_mus is None:
+        probe_mus = _TWO_SIDED_PROBE_MUS if two_sided else _FOLDED_PROBE_MUS
+    sweep = sweep_wavefunction_grid(
+        adapter.to(device), hamiltonian, probe_mus, device=device
+    )
+    path = out_dir / "wavefunctions.png"
+    plot_wavefunction_grid(sweep, hopping=hamiltonian.hopping, save_path=path, dpi=dpi)
+    plt.close("all")
+    return path
