@@ -36,7 +36,7 @@ from .figures import (
     plot_wavefunction_waterfall,
 )
 from .plots import plot_energy_and_edge_weight, plot_loss_curves, plot_wavefunctions
-from .report import save_run_figures
+from .report import rerender_wavefunctions, save_run_figures
 from .style import (
     PALETTE,
     annotate_phases,
@@ -80,6 +80,7 @@ __all__ = [
     "plot_wavefunctions",
     "plot_wavefunction_grid",
     "plot_wavefunction_waterfall",
+    "rerender_wavefunctions",
     "save_run_figures",
     "PALETTE",
     "annotate_phases",
