@@ -1,10 +1,22 @@
 """Matched-conditions, multi-seed comparison of the four Kitaev-chain models.
 
-Every model is trained under ONE shared configuration -- identical
-``SamplingRegion`` mixture (mirrored for the two-sided models), identical
-two-phase budget (AdamW + L-BFGS), identical ``mu`` grid -- and scored with
+Every model shares the evaluation harness -- identical ``SamplingRegion``
+mixture (mirrored for the two-sided models), identical ``mu`` grid,
+identical two-phase *structure* (AdamW warm-up then L-BFGS fine-tune), and
 the shared :class:`BdGEvaluationProbe` metric set plus a mu-reflection
 residual.
+
+The AdamW epoch budget is set *per model* (``Recipe.adam_epochs``), each to
+its own convergence plateau from the ``--budget-sweep`` pilot. A single
+shared budget would guard against "model X only won because it trained
+longer"; that objection does not apply here, because every model reaches
+its floor on the gauge-invariant metrics (energy, subspace) well inside any
+of these budgets, and the Nambu-basis models' per-site density error in the
+topological phase is under-determined by the objective and so does not
+improve with more epochs (see
+``docs/markdown/under-determination-and-n-scaling.md``). Training each model
+to its own plateau is therefore the honest choice; the L-BFGS tail is fixed
+across models.
 
 All configuration is recorded exhaustively: per-region sample counts (per
 batch / per epoch / over the AdamW phase), the frozen validation and L-BFGS
@@ -13,7 +25,32 @@ architecture (layer list, parameter counts, buffers) go out as ``sesh``
 model / dataset cards; per-run outcomes go via ``log_metrics``; the six
 standard figures per (model, seed) are rendered by
 :func:`kitaev.visualisation.save_run_figures`; a tidy CSV and a per-model
-mean +/- std summary are also written.
+median / IQR / worst-seed / pass-rate summary are also written. The CSV lives
+in the session
+directory, so a run never overwrites an earlier one and the
+interpretability notebook can load it from the same place as the
+checkpoints.
+
+Each label-free model runs its full fixed budget and the final-epoch state
+is the one scored, checkpointed, and figured (``restore_best=False``).
+Best-validation selection is avoided because the label-free loss plateaus
+at its energy-squared floor while the eigenvector is still sharpening.
+``semi_supervised`` is the exception: it consumes exact labels, its
+validation loss bottoms out well before the budget ends, and it keeps its
+best-validation state (``restore_best=True``) so the comparison measures
+the approach rather than a hobbled version of it. Every CSV row carries
+provenance for the state it describes -- ``completed``,
+``final_epoch``, ``best_val_epoch`` / ``best_val_loss``,
+``state_dict_sha256`` -- and a convergence read-out: ``var_tail_decades``
+and ``infidelity_tail_decades`` (base-10 decades of descent over the final
+quarter of training) with a ``converged`` flag that is true when both are
+below 0.3.
+
+An optional ``--budget-sweep`` mode replaces the comparison with an AdamW
+epoch-count ablation (fixed L-BFGS tail) to show the trivial-phase gap is
+stable across training budgets. It writes the same per-run figures and
+checkpoint as the main comparison, keyed by budget under
+``figures/<model>/adam_<budget>/seed_<seed>/``.
 
 ``sesh`` currently writes every model card to
 ``<sub_folder>/model_card.md`` and every dataset card to
@@ -27,20 +64,31 @@ This exists to settle the trivial-phase accuracy finding (structural Nambu
 sampling regions AND the L-BFGS budget (nb 4 ran 100 L-BFGS epochs, nb 3 ran
 300). Here both are held fixed so the comparison is clean.
 
+After the seed loop, cross-model figures are rendered from the checkpoints
+into ``<session>/figures/comparison/`` -- the headline energy-error panel,
+a spectral-fan context figure and a per-model density waterfall.
+``--figures-only <session dir>`` re-renders just those against an existing
+run without retraining.
+
 Usage:
     python experiments/four_model_comparison.py --smoke
     python experiments/four_model_comparison.py --seeds 0 1 2 3 4
+    python experiments/four_model_comparison.py --budget-sweep \\
+        --models chiral structural_nambu --seeds 0 1
+    python experiments/four_model_comparison.py --figures-only \\
+        results/logs/<session>
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import math
 import platform
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from statistics import mean, pstdev
 from typing import Any
 
 import numpy as np
@@ -71,7 +119,18 @@ from kitaev.training.loss import (
 )
 from kitaev.training.sampling import SamplingConfig, build_sampling
 from kitaev.training.trainer import _build_kitaev_operators
-from kitaev.visualisation import save_run_figures
+from kitaev.visualisation import (
+    build_model_error_band,
+    fsm_convergence_floor,
+    plot_model_comparison,
+    plot_pair_density_waterfall,
+    plot_spectral_fan,
+    plot_wavefunction_waterfall,
+    save_run_figures,
+    sweep_low_spectrum,
+    sweep_spectrum,
+    sweep_wavefunctions,
+)
 
 # --------------------------------------------------------------------------
 # Shared physical parameters
@@ -85,8 +144,14 @@ MU_GRID = np.linspace(-4.0, 4.0, 240)
 # --------------------------------------------------------------------------
 # Shared, matched training configuration
 # --------------------------------------------------------------------------
+# adam_epochs here is only the fallback for a recipe that does not set its
+# own Recipe.adam_epochs, and the base the --budget-sweep overrides. The
+# converged run-of-record budgets are per model (see the RECIPES table),
+# each taken from the 20260829 pilot sweep: structural_nambu plateaus by
+# ~9k, chiral settles by ~12k, semi_supervised converges early (label
+# driven, restore_best), nambu_baseline follows structural_nambu.
 TWO_PHASE = TwoPhaseConfig(
-    adam_epochs=3000,
+    adam_epochs=9000,
     adam_lr=8e-4,
     adam_weight_decay=1e-6,
     lbfgs_epochs=300,
@@ -103,15 +168,41 @@ SMOKE_TWO_PHASE = TwoPhaseConfig(
     lbfgs_history_size=10,
     lbfgs_line_search_fn="strong_wolfe",
 )
+# restore_best=False is the default: the label-free models run their full
+# fixed budget and the final-epoch state is the one scored and
+# checkpointed. Best-validation selection is unwanted for them because the
+# label-free loss plateaus at its energy-squared floor long before the
+# eigenvector stops sharpening, so a rollback would freeze a worse
+# wavefunction. The best epoch is still recorded per run (see the
+# provenance columns in run_one). Individual recipes override this via
+# Recipe.restore_best -- semi_supervised does, being label-driven.
 TWO_PHASE_BASE = TrainerConfig(
-    epochs=1, print_freq=1000, patience=None, grad_clip_norm=1.0
+    epochs=1, print_freq=1000, patience=None, grad_clip_norm=1.0, restore_best=False
 )
+# A seed "passes" if it clears both bars at once: energy MAE over the full
+# domain, and worst-mu subspace infidelity. The pass-rate over seeds is the
+# single most legible reliability number and it exposes the models that are
+# bimodal over seeds (a median alone hides those). See summarise().
+PASS_E_MAE_MAX = 1e-4
+PASS_INFIDELITY_MAX = 1e-2
+
+# A run is called converged if both its eigenvector-consistency loss and
+# its subspace infidelity fell by less than this many base-10 decades over
+# the final quarter of training. More than this means the budget is short.
+CONVERGENCE_DECADE_TOL = 0.3
 
 # One region mixture, dense on the transition shoulders and the deep
 # interior. HALF is for the folded models (train on [0, 4t]); FULL is its
 # mirror for the two-sided models, at 2x the batch to match density.
+#
+# The lower edge is 0.01t, not 0. Right at mu = 0 the smallest singular
+# value sigma_1 -> 0, so the folded-spectrum objective has no gradient
+# there and the folded models cannot be constrained in |mu| <~ 0.01t; the
+# small residual bump seen at mu = 0 is that domain-edge degeneracy, not a
+# model failure. The fold itself (psi(-mu) from psi(mu)) is exact, so the
+# lower edge can sit as close to 0 as we like without breaking anything.
 HALF_REGIONS = (
-    SamplingRegion(low=0.05, high=4.0, weight=1.0),
+    SamplingRegion(low=0.01, high=4.0, weight=1.0),
     SamplingRegion(low=1.7, high=2.6, weight=1.5),
     SamplingRegion(low=2.0, high=4.0, weight=0.5),
 )
@@ -137,6 +228,12 @@ LABELLED_BATCH = 70
 SMOKE_N_LABELLED_TRAIN = 28
 SMOKE_N_LABELLED_VAL = 14
 SMOKE_LABELLED_BATCH = 14
+
+# AdamW-epoch budgets for the optional --budget-sweep ablation. Only the
+# AdamW count varies; the L-BFGS tail stays fixed so the point is "does
+# more first-stage optimisation help", not "does more of everything help".
+BUDGET_SWEEP_DEFAULT = (1000, 2000, 3000, 6000)
+SMOKE_BUDGET_SWEEP = (4, 8)
 
 
 def _two_phase(smoke: bool) -> TwoPhaseConfig:
@@ -295,9 +392,16 @@ def model_metadata(model: torch.nn.Module) -> dict[str, Any]:
     }
 
 
-def optimiser_metadata(smoke: bool) -> dict[str, Any]:
-    """The complete two-phase optimiser spec (see run_two_phase)."""
+def optimiser_metadata(smoke: bool, adam_epochs: int | None = None) -> dict[str, Any]:
+    """The complete two-phase optimiser spec (see run_two_phase).
+
+    ``adam_epochs`` overrides the AdamW phase length for this card, so a
+    per-model :attr:`Recipe.adam_epochs` is reflected accurately. It is
+    ignored under ``smoke``.
+    """
     tp = _two_phase(smoke)
+    if adam_epochs is not None and not smoke:
+        tp = replace(tp, adam_epochs=adam_epochs)
     return {
         "strategy": (
             "two-phase (run_two_phase): AdamW warm-up, then L-BFGS fine-tune "
@@ -329,7 +433,10 @@ def optimiser_metadata(smoke: bool) -> dict[str, Any]:
             ),
         },
         "early_stopping": "disabled (patience=None); each phase runs its full budget",
-        "checkpoint_selection": "lowest validation loss over the run (frozen val pool)",
+        "checkpoint_selection": (
+            "final-epoch state (restore_best=False); the best validation epoch "
+            "is recorded per run but not restored"
+        ),
     }
 
 
@@ -357,6 +464,30 @@ class Recipe:
     card_loss: dict[str, Any]
     card_description: str
     weight_key: str | None = None  # annealing-weight series, if the loss has one
+    basis: str = "nambu"  # residual basis for the XAI pipeline: "nambu" | "chiral"
+    # train-history key for the eigenvector-consistency term, whose tail
+    # slope says whether the wavefunction was still sharpening at the budget
+    # cut-off (see the convergence columns in run_one).
+    residual_key: str = "var"
+    # multiplier on <E_1(mu)^2> for the analytic floor line on the loss
+    # figure. 1.0 for the Nambu folded-spectrum losses, 2.0 for the chiral
+    # loss (it sums two residual terms), None for losses with no such floor
+    # (semi_supervised's supervised residual bottoms out at zero).
+    fsm_floor_factor: float | None = 1.0
+    # Per-recipe override of the shared restore_best=False protocol. The
+    # label-free structural models all run their full fixed budget and keep
+    # the final-epoch state. semi_supervised is the exception: it is the
+    # only model that consumes exact labels, its folded-spectrum-dominated
+    # validation loss bottoms out long before the budget ends, and holding
+    # it to restore_best=False measures a hobbled version of it rather than
+    # the approach itself. It therefore keeps its best-validation state.
+    restore_best: bool = False
+    # Per-model AdamW epoch budget for the converged run of record, each set
+    # to the model's own plateau from the --budget-sweep pilot. None falls
+    # back to TWO_PHASE.adam_epochs. Ignored under --smoke and overridden by
+    # --budget-sweep. See the module docstring for why the budget is not
+    # shared across models.
+    adam_epochs: int | None = None
     run_kwargs: dict = field(default_factory=dict)
 
 
@@ -373,6 +504,7 @@ _SIREN_STATIC = {
 RECIPES: dict[str, Recipe] = {
     "structural_nambu": Recipe(
         name="structural_nambu",
+        adam_epochs=9000,  # pilot: flat 9k -> 12k
         two_sided=False,
         build_model=lambda: SirenPINNNambuFolded(
             n_sites=2 * N, hidden_features=64, hidden_layers=2, input_scale=4.0
@@ -445,6 +577,8 @@ RECIPES: dict[str, Recipe] = {
     ),
     "chiral": Recipe(
         name="chiral",
+        # pilot: settles by ~12k (E MAE ~3e-6, two orders under the pass bar)
+        adam_epochs=12000,
         two_sided=False,
         build_model=lambda: SirenPINNChiral(
             n_sites=N, hidden_features=64, hidden_layers=2, input_scale=4.0
@@ -456,6 +590,8 @@ RECIPES: dict[str, Recipe] = {
         plot_label="chiral PINN",
         component_keys=("fsm", "var", "lam_mean"),
         structural_fold=True,
+        basis="chiral",
+        fsm_floor_factor=2.0,  # loss_fsm = mean||hv||^2 + mean||h^T u||^2
         card_architecture=(
             "SIREN coordinate backbone; one head -> (u, v), the left/right "
             "singular vectors of the smallest singular value of the real "
@@ -527,6 +663,8 @@ RECIPES: dict[str, Recipe] = {
     ),
     "nambu_baseline": Recipe(
         name="nambu_baseline",
+        # no direct pilot; follows structural_nambu (same basis, softer loss)
+        adam_epochs=9000,
         two_sided=True,
         build_model=lambda: SirenPINN(
             n_sites=2 * N, hidden_features=64, hidden_layers=2, input_scale=4.0
@@ -603,6 +741,7 @@ RECIPES: dict[str, Recipe] = {
     ),
     "semi_supervised": Recipe(
         name="semi_supervised",
+        adam_epochs=4000,  # label-driven + restore_best; converges early
         two_sided=True,
         build_model=lambda: SirenPINNDualHead(
             n_sites=2 * N, hidden_features=64, hidden_layers=3, input_scale=4.0
@@ -614,9 +753,15 @@ RECIPES: dict[str, Recipe] = {
         build_adapt=lambda m: m,  # the dual head already returns (E, psi)
         build_loaders=lambda smoke: _semisupervised_loaders(smoke),
         loss_class="SemiSupervisedLoss",
-        plot_label="dual-head PINN",
+        plot_label="dual-head PINN (v1)",
         component_keys=("e", "psi", "res", "ph"),
         weight_key="physics_wt",
+        residual_key="res",
+        fsm_floor_factor=None,  # supervised residual has no E_1^2 floor
+        # The original approach and the only label-consuming model; kept in
+        # the comparison to motivate the move to label-free structural
+        # methods, and evaluated under its intended protocol (best-val).
+        restore_best=True,
         structural_fold=False,
         card_architecture=(
             "SIREN coordinate backbone with two linear heads: a scalar energy "
@@ -814,7 +959,12 @@ _STANDARD_FIGURES = (
 
 
 def log_model_card(
-    session: Session, recipe: Recipe, seeds: list[int], *, smoke: bool
+    session: Session,
+    recipe: Recipe,
+    seeds: list[int],
+    *,
+    smoke: bool,
+    adam_epochs: int | None = None,
 ) -> None:
     """One exhaustive card per model, each in its own sub_folder.
 
@@ -847,7 +997,7 @@ def log_model_card(
         training_metadata={
             "regime": regime,
             "loss": recipe.card_loss,
-            "optimiser": optimiser_metadata(smoke),
+            "optimiser": optimiser_metadata(smoke, adam_epochs),
             "dataset_card": dataset_card,
             "evaluation": {
                 "probe": "BdGEvaluationProbe on linspace(-4, 4, 240), every 50 epochs",
@@ -963,6 +1113,41 @@ def _semisupervised_loaders(smoke: bool) -> LoaderBundle:
     )
 
 
+def _state_dict_sha256(model: torch.nn.Module) -> str:
+    """Deterministic SHA-256 over a model's parameters and buffers.
+
+    Hashes each tensor's raw bytes in sorted-key order, so the digest
+    identifies exactly the weights that were scored and checkpointed and
+    can be matched against the ``seed_*.pt`` file later.
+    """
+    digest = hashlib.sha256()
+    state = model.state_dict()
+    for key in sorted(state):
+        digest.update(key.encode())
+        digest.update(state[key].detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _tail_decades(series: list[float], frac: float = 0.25) -> float:
+    """Base-10 decades a positive series fell across its final ``frac``.
+
+    A small positive number means the series had flattened by the budget
+    cut-off. A large one means it was still descending and the budget is
+    too short. Endpoints are averaged over a few samples to damp the
+    L-BFGS tail's jumpiness. Returns 0.0 if the series is too short or
+    non-positive.
+    """
+    if len(series) < 8:
+        return 0.0
+    tail = series[-max(4, int(len(series) * frac)) :]
+    window = max(1, len(tail) // 4)
+    start = float(np.mean(tail[:window]))
+    end = float(np.mean(tail[-window:]))
+    if start <= 0.0 or end <= 0.0:
+        return 0.0
+    return math.log10(start) - math.log10(end)
+
+
 def _reflection_residual(adapter, device) -> float:
     """max_mu | |E(mu)| - |E(-mu)| | over [0, 4t] -- 0 iff mu-parity is exact."""
     adapter.eval()
@@ -974,8 +1159,101 @@ def _reflection_residual(adapter, device) -> float:
     return float(np.abs(e_pos - e_neg).max())
 
 
-def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict:
-    """Train one (model, seed) under the shared config; return a metric row."""
+def _topo_density_maes(adapter: Any, device: str) -> tuple[float, float]:
+    """Topological-phase site-density error: gauge-invariant vs raw.
+
+    Both are means of ``|predicted - exact|`` over ``|mu| < 2t`` on
+    ``MU_GRID``, with each state unit-normalised so its density has total
+    mass 1.
+
+    Returns ``(pair_density_mae, raw_density_mae)``, both MAEs over the
+    ``|mu| < 2t`` grid of ``MU_GRID`` with each state unit-normalised:
+
+    - ``pair_density_mae`` -- error of the gauge-invariant site density
+      ``P_nn``, the particle-block diagonal of the projector onto the
+      near-zero 2D subspace. For the model this is the diagonal of the
+      projector onto ``span{psi, Xi psi}`` (Gram-Schmidt orthonormalised);
+      for the reference it is the sum of squares of the two smallest-|E|
+      exact eigenvectors. Basis-independent, so it is invariant to any
+      rotation within the degenerate manifold; bounded by the subspace
+      infidelity and expected to fall with the training budget for every
+      model.
+    - ``raw_density_mae`` -- per-site ``|Delta p_n| + |Delta h_n|`` of the
+      raw sector densities ``|psi_k|^2`` against a single ``eigh``
+      representative (``vecs[:, N]``). Gauge-*dependent* in the
+      topological phase: neither the folded-spectrum loss nor ``eigh``
+      pins a representative within the near-degenerate ``+-sigma_1`` pair.
+      Expected to plateau for the Nambu models (the flat direction is
+      never resolved) and to fall for the chiral model (its ``N x N`` SVD
+      residual has no flat direction).
+
+    ``raw_density_mae - pair_density_mae`` is, to leading order, the part
+    of the density error confined to the gauge degree of freedom.
+    """
+    adapter.eval()
+    hamiltonian = KitaevChainHamiltonian(n_sites=N, hopping=T, pairing=DELTA)
+    mu = MU_GRID[np.abs(MU_GRID) < TRANSITION]
+    with torch.no_grad():
+        psi = (
+            adapter(torch.tensor(mu[:, None], dtype=torch.float32, device=device))[1]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    psi = psi / np.linalg.norm(psi, axis=1, keepdims=True)
+
+    raw_gap = np.empty((mu.size, N))
+    pair_gap = np.empty((mu.size, N))
+    for i, m in enumerate(mu):
+        w, vecs = np.linalg.eigh(hamiltonian.build(float(m)))
+        near = vecs[:, np.argsort(np.abs(w))[:2]]  # exact 2D near-zero basis
+        p_exact = (near[:N, :] ** 2).sum(axis=1)  # projector diagonal, particle
+        ref = vecs[:, N] ** 2  # one eigh representative, all 2N sectors
+
+        u1 = psi[i]
+        u2 = np.concatenate([psi[i, N:], psi[i, :N]])  # Xi @ psi
+        u2 = u2 - (u1 @ u2) * u1
+        nrm = np.linalg.norm(u2)
+        u2 = u2 / nrm if nrm > 1e-9 else u2
+        p_pred = u1[:N] ** 2 + u2[:N] ** 2
+
+        pair_gap[i] = np.abs(p_pred - p_exact)
+        raw_gap[i] = np.abs(psi[i, :N] ** 2 - ref[:N]) + np.abs(
+            psi[i, N:] ** 2 - ref[N:]
+        )
+    return float(np.mean(pair_gap)), float(np.mean(raw_gap))
+
+
+def run_one(
+    recipe: Recipe,
+    seed: int,
+    *,
+    smoke: bool,
+    session: Session,
+    two_phase: TwoPhaseConfig | None = None,
+    light: bool = False,
+    artefact_tag: str | None = None,
+) -> dict:
+    """Train one (model, seed) under the shared config; return a metric row.
+
+    Args:
+        recipe: The model recipe to run.
+        seed: Random seed for this run.
+        smoke: Use the tiny wiring-check budget.
+        session: The run's :class:`sesh.Session`.
+        two_phase: Override the two-phase schedule. Defaults to the smoke
+            or full schedule per ``smoke``. Used by the budget sweep to
+            vary only the AdamW epoch count.
+        light: Skip the per-run figures and checkpoint entirely. Off by
+            default; nothing in this script sets it, but it is kept as an
+            escape hatch for callers that only want the metric row.
+        artefact_tag: Extra path segment between the model name and
+            ``seed_<seed>`` for the checkpoint and figure directories, so
+            repeated (model, seed) runs at different settings do not
+            collide. The budget sweep passes ``"adam_<budget>"``; the
+            default (``None``) keeps the plain ``<model>/seed_<seed>``
+            layout the interpretability notebook expects.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     accelerator = Accelerator()
@@ -985,7 +1263,8 @@ def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict
         x.to(device) for x in _build_kitaev_operators(N, hopping=T, pairing=DELTA)
     )
 
-    two_phase = _two_phase(smoke)
+    two_phase = two_phase or _two_phase(smoke)
+    base_config = replace(TWO_PHASE_BASE, restore_best=recipe.restore_best)
     model = recipe.build_model()
     loss_fn = recipe.build_loss(two_phase)
     adapt = recipe.build_adapt
@@ -1012,7 +1291,7 @@ def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict
         H_mu_diag=H_mu_diag,
         Xi=Xi,
         two_phase=two_phase,
-        base_config=TWO_PHASE_BASE,
+        base_config=base_config,
         callbacks=[*loaders.sampling_callbacks, probe],
         val_loader=loaders.val,
         unlabeled_loader=loaders.unlabeled,
@@ -1025,19 +1304,61 @@ def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict
 
     adapter = adapt(trained).to(device)
 
-    save_run_figures(
-        adapter=adapter,
-        history=history,
-        hamiltonian=KitaevChainHamiltonian(n_sites=N, hopping=T, pairing=DELTA),
-        mu_grid=MU_GRID,
-        out_dir=session.path("figures", recipe.name, f"seed_{seed}"),
-        model_label=recipe.plot_label,
-        component_keys=recipe.component_keys,
-        weight_key=recipe.weight_key,
-        split_epoch=two_phase.adam_epochs,
-        structural_fold=recipe.structural_fold,
-        device=device,
+    # Provenance: the returned model is the final-epoch state for every
+    # recipe except semi_supervised (restore_best=True -> best-validation
+    # state); these columns pin down which state that was and whether the
+    # budget was long enough. Derived from the concatenated two-phase
+    # history, so no extra trainer plumbing.
+    expected_epochs = two_phase.adam_epochs + max(0, two_phase.lbfgs_epochs)
+    final_epoch = len(history["train_loss"])
+    val_loss_series = history.get("val_loss", [])
+    best_val_epoch = (
+        min(range(len(val_loss_series)), key=val_loss_series.__getitem__) + 1
+        if val_loss_series
+        else None
     )
+    pair_density_mae_topo, raw_density_mae_topo = _topo_density_maes(adapter, device)
+
+    resid_series = history.get(f"train_{recipe.residual_key}", history["train_loss"])
+    var_tail_decades = _tail_decades(resid_series)
+    infidelity_tail_decades = _tail_decades(history["probe_subspace_infidelity"])
+    converged = (
+        var_tail_decades < CONVERGENCE_DECADE_TOL
+        and infidelity_tail_decades < CONVERGENCE_DECADE_TOL
+    )
+
+    if not light:
+        # Persist the trained weights so the interpretability notebook can
+        # rebuild this model without retraining. One file per (model, seed)
+        # -- or per (model, tag, seed) when artefact_tag is set (the budget
+        # sweep). session.path() makes and returns a directory, so name the
+        # file under it.
+        artefact_seg = (
+            (recipe.name,) if artefact_tag is None else (recipe.name, artefact_tag)
+        )
+        checkpoint_dir = session.path("checkpoints", *artefact_seg)
+        torch.save(trained.state_dict(), checkpoint_dir / f"seed_{seed}.pt")
+
+        hamiltonian = KitaevChainHamiltonian(n_sites=N, hopping=T, pairing=DELTA)
+        floor_value = (
+            fsm_convergence_floor(hamiltonian, MU_GRID, factor=recipe.fsm_floor_factor)
+            if recipe.fsm_floor_factor is not None
+            else None
+        )
+        save_run_figures(
+            adapter=adapter,
+            history=history,
+            hamiltonian=hamiltonian,
+            mu_grid=MU_GRID,
+            out_dir=session.path("figures", *artefact_seg, f"seed_{seed}"),
+            model_label=recipe.plot_label,
+            component_keys=recipe.component_keys,
+            weight_key=recipe.weight_key,
+            split_epoch=two_phase.adam_epochs,
+            floor_value=floor_value,
+            structural_fold=recipe.structural_fold,
+            device=device,
+        )
 
     row = {
         "model": recipe.name,
@@ -1048,11 +1369,27 @@ def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict
         "subspace_infidelity_mean": history["probe_subspace_infidelity"][-1],
         "subspace_infidelity_max": history["probe_subspace_infidelity_max"][-1],
         "edge_mae": history["probe_edge_mae"][-1],
+        # topological-phase density error: gauge-invariant (rho_n) vs raw
+        # (2N sectors). The gap raw - pair is the gauge-confined part; it is
+        # expected to persist for the Nambu models across budgets and
+        # vanish for the chiral model. See _topo_density_maes.
+        "pair_density_mae_topo": pair_density_mae_topo,
+        "raw_density_mae_topo": raw_density_mae_topo,
         "psi_norm": history["probe_psi_norm"][-1],
         "reflection_residual": _reflection_residual(adapter, device),
         "train_loss_final": history["train_loss"][-1],
-        "epochs": len(history["train_loss"]),
+        "epochs": final_epoch,
         "wall_seconds": round(wall, 1),
+        # provenance / convergence
+        "restore_best": recipe.restore_best,
+        "completed": final_epoch >= expected_epochs,
+        "final_epoch": final_epoch,
+        "best_val_epoch": best_val_epoch,
+        "best_val_loss": min(val_loss_series) if val_loss_series else None,
+        "state_dict_sha256": _state_dict_sha256(trained),
+        "var_tail_decades": round(var_tail_decades, 3),
+        "infidelity_tail_decades": round(infidelity_tail_decades, 3),
+        "converged": converged,
     }
 
     session.log_metrics(
@@ -1063,39 +1400,280 @@ def run_one(recipe: Recipe, seed: int, *, smoke: bool, session: Session) -> dict
         f"[{recipe.name} seed {seed}] "
         f"E MAE topo {row['e_mae_topological']:.3e} / triv "
         f"{row['e_mae_trivial']:.3e} | infid {row['subspace_infidelity_mean']:.3e} "
-        f"| edge {row['edge_mae']:.3e} | refl {row['reflection_residual']:.2e}"
+        f"| edge {row['edge_mae']:.3e} | refl {row['reflection_residual']:.2e} "
+        f"| converged={row['converged']} "
+        f"(var {row['var_tail_decades']:+.2f} dec, "
+        f"infid {row['infidelity_tail_decades']:+.2f} dec)"
     )
     return row
 
 
+def run_budget_sweep(
+    session: Session,
+    *,
+    models: list[str],
+    seeds: list[int],
+    budgets: tuple[int, ...],
+    smoke: bool,
+) -> list[dict]:
+    """Train each (model, budget, seed) with a fixed L-BFGS tail.
+
+    Only the AdamW epoch count varies. The cosine schedule's ``T_max``
+    tracks it (see :func:`run_two_phase`), so every point is a complete
+    schedule rather than a truncated one. Each (model, budget, seed) run
+    writes the same per-run figures and checkpoint as the main comparison,
+    under ``figures/<model>/adam_<budget>/seed_<seed>/`` (and the matching
+    ``checkpoints/`` path), so the loss curve and probe history at every
+    budget can be inspected directly.
+
+    Args:
+        session: The run's :class:`sesh.Session`.
+        models: Model recipe names to sweep.
+        seeds: Seeds per (model, budget).
+        budgets: AdamW epoch counts to try.
+        smoke: Use the tiny wiring-check L-BFGS tail and batch sizes.
+
+    Returns:
+        One metric row per (model, budget, seed), each tagged with
+        ``adam_epochs``.
+    """
+    base = _two_phase(smoke)
+    rows: list[dict] = []
+    for model_name in models:
+        recipe = RECIPES[model_name]
+        for budget in budgets:
+            two_phase = replace(base, adam_epochs=budget)
+            for seed in seeds:
+                row = run_one(
+                    recipe,
+                    seed,
+                    smoke=smoke,
+                    session=session,
+                    two_phase=two_phase,
+                    artefact_tag=f"adam_{budget}",
+                )
+                row["adam_epochs"] = budget
+                rows.append(row)
+                session.info(
+                    f"[sweep {recipe.name} budget {budget} seed {seed}] "
+                    f"E MAE triv {row['e_mae_trivial']:.3e} | "
+                    f"infid {row['subspace_infidelity_mean']:.3e}"
+                )
+    return rows
+
+
+def render_comparison_figures(
+    session_dir: Path,
+    *,
+    models: list[str],
+    device: str = "cpu",
+) -> dict[str, Path]:
+    """Cross-model figures from a finished run's checkpoints.
+
+    Reloads every ``seed_*.pt`` under ``<session_dir>/checkpoints/`` and
+    writes the headline comparison panel, a spectral-fan context figure
+    and a per-model density waterfall into
+    ``<session_dir>/figures/comparison/``. No training, so it doubles as
+    the body of ``--figures-only``.
+
+    Args:
+        session_dir: A comparison run's session directory.
+        models: Recipe names to include, in plot order. Every seed
+            checkpoint found on disk for each is used.
+        device: Device for the model forward passes.
+
+    Returns:
+        A mapping from figure name to the path it was written to.
+    """
+    from kitaev.xai.loading import load_seed_checkpoints
+
+    hamiltonian = KitaevChainHamiltonian(n_sites=N, hopping=T, pairing=DELTA)
+    out_dir = session_dir / "figures" / "comparison"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bands = []
+    spectra_repr: dict[str, object] = {}
+    repr_checkpoint: dict[str, tuple[object, int]] = {}
+    for name in models:
+        recipe = RECIPES[name]
+        checkpoints = load_seed_checkpoints(
+            recipe.build_model, session_dir / "checkpoints" / name, device=device
+        )
+        if not checkpoints:
+            print(f"skip {name}: no checkpoints under {session_dir}")
+            continue
+        sweeps = [
+            sweep_spectrum(
+                recipe.build_adapt(model).to(device),
+                hamiltonian,
+                MU_GRID,
+                device=device,
+            )
+            for model in checkpoints
+        ]
+        bands.append(build_model_error_band(recipe.plot_label, sweeps))
+        # The waterfall shows one seed; pick the one whose energy error is
+        # nearest the seed-wise median so it is not an unlucky outlier.
+        seed_error = np.array([float(np.mean(s.abs_error)) for s in sweeps])
+        idx = int(np.argmin(np.abs(seed_error - np.median(seed_error))))
+        spectra_repr[name] = sweeps[idx]
+        repr_checkpoint[name] = (checkpoints[idx], idx)
+
+    paths: dict[str, Path] = {}
+    if bands:
+        paths["comparison"] = out_dir / "energy_error.png"
+        plot_model_comparison(bands, hopping=T, save_path=paths["comparison"])
+
+        fan_model = "chiral" if "chiral" in spectra_repr else next(iter(spectra_repr))
+        paths["spectral_fan"] = out_dir / "spectral_fan.png"
+        plot_spectral_fan(
+            sweep_low_spectrum(hamiltonian, MU_GRID, n_levels=4),
+            hopping=T,
+            predicted=spectra_repr[fan_model],  # type: ignore[arg-type]
+            model_label=RECIPES[fan_model].plot_label,
+            save_path=paths["spectral_fan"],
+        )
+
+    dense_mu = np.linspace(float(MU_GRID.min()), float(MU_GRID.max()), 160)
+    for name in models:
+        recipe = RECIPES[name]
+        if name not in repr_checkpoint:
+            continue
+        model, idx = repr_checkpoint[name]
+        wf = sweep_wavefunctions(
+            recipe.build_adapt(model).to(device),
+            hamiltonian,
+            list(dense_mu),
+            device=device,
+        )
+        label = f"{recipe.plot_label} (seed {idx})"
+        key = f"waterfall_{name}"
+        paths[key] = out_dir / f"{key}.png"
+        plot_wavefunction_waterfall(
+            wf, hopping=T, model_label=label, save_path=paths[key]
+        )
+        # The fair cross-model view: the raw particle/hole split above is
+        # gauge-dependent inside the topological phase, the pair density is
+        # not (see plot_pair_density_waterfall).
+        pair_key = f"pair_density_{name}"
+        paths[pair_key] = out_dir / f"{pair_key}.png"
+        plot_pair_density_waterfall(
+            wf, hopping=T, model_label=label, save_path=paths[pair_key]
+        )
+
+    return paths
+
+
+def _seed_agg(rows: list[dict], key: str) -> str:
+    """``median [q25, q75] max`` of ``key`` over ``rows``, for the summaries.
+
+    Missing keys (older CSVs, budget-sweep rows) aggregate to ``nan``
+    rather than raising.
+    """
+    a = np.asarray([r.get(key, float("nan")) for r in rows], dtype=float)
+    lo, hi = (float(x) for x in np.percentile(a, [25, 75]))
+    return f"{float(np.median(a)):.2e} [{lo:.2e}, {hi:.2e}] {a.max():.2e}"
+
+
+_SUMMARY_COL = 40
+
+
 def summarise(rows: list[dict]) -> str:
-    """Per-model mean +/- population std over seeds, as an aligned table."""
+    """Per-model seed summary: median [q25, q75] max, plus a pass-rate.
+
+    Central tendency is the median with the inter-quartile range; the
+    worst seed (max) sits alongside because several models are bimodal
+    over seeds and a median alone hides that. ``pass`` counts the seeds
+    clearing a fixed reliability bar (``PASS_E_MAE_MAX`` on full-domain
+    energy MAE and ``PASS_INFIDELITY_MAX`` on worst-mu subspace
+    infidelity).
+    """
     metrics = [
-        "e_mae_topological",
-        "e_mae_trivial",
         "e_mae_full",
-        "subspace_infidelity_mean",
+        "e_mae_topological",
         "subspace_infidelity_max",
-        "edge_mae",
-        "reflection_residual",
+        "pair_density_mae_topo",
+        "raw_density_mae_topo",
     ]
     by_model: dict[str, list[dict]] = {}
     for r in rows:
         by_model.setdefault(r["model"], []).append(r)
 
-    lines = [f"{'model':<18} " + "  ".join(f"{m:>26}" for m in metrics)]
+    sub = "median [q25, q75] max"
+    lines = [
+        f"{'model':<18} " + "  ".join(f"{m:>{_SUMMARY_COL}}" for m in metrics),
+        f"{'':<18} " + "  ".join(f"{sub:>{_SUMMARY_COL}}" for _ in metrics),
+    ]
     for model, model_rows in by_model.items():
-        cells = []
-        for m in metrics:
-            vals = [r[m] for r in model_rows]
-            mu = mean(vals)
-            sd = pstdev(vals) if len(vals) > 1 else 0.0
-            cells.append(f"{mu:.3e}+/-{sd:.1e}")
-        lines.append(f"{model:<18} " + "  ".join(f"{c:>26}" for c in cells))
+        cells = [_seed_agg(model_rows, m) for m in metrics]
+        lines.append(f"{model:<18} " + "  ".join(f"{c:>{_SUMMARY_COL}}" for c in cells))
+
+    lines.append("")
+    lines.append(
+        f"{'model':<18} {'completed':>10} {'converged':>10} {'pass':>8}   "
+        "worst infidelity-tail"
+    )
+    for model, model_rows in by_model.items():
+        n = len(model_rows)
+        done = sum(bool(r["completed"]) for r in model_rows)
+        conv = sum(bool(r["converged"]) for r in model_rows)
+        passed = sum(
+            r["e_mae_full"] < PASS_E_MAE_MAX
+            and r["subspace_infidelity_max"] < PASS_INFIDELITY_MAX
+            for r in model_rows
+        )
+        worst = max(r["infidelity_tail_decades"] for r in model_rows)
+        lines.append(
+            f"{model:<18} {f'{done}/{n}':>10} {f'{conv}/{n}':>10} "
+            f"{f'{passed}/{n}':>8}   {worst:+.2f} decades"
+        )
     return "\n".join(lines)
 
 
-def main() -> None:
+def summarise_budget_sweep(rows: list[dict]) -> str:
+    """Per (model, adam_epochs): median [q25, q75] max over seeds.
+
+    The convergence read-outs -- ``var_tail_decades`` and the
+    ``converged`` count -- are the point of the sweep: they say where a
+    fixed budget can stop.
+    """
+    metrics = [
+        "e_mae_topological",
+        "subspace_infidelity_mean",
+        "raw_density_mae_topo",
+        "var_tail_decades",
+    ]
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["model"], r["adam_epochs"]), []).append(r)
+
+    cols = "  ".join(f"{m:>{_SUMMARY_COL}}" for m in metrics)
+    lines = [f"{'model':<18} {'adam_epochs':>11} {cols}   converged"]
+    for (model, budget), group in sorted(groups.items()):
+        cells = [_seed_agg(group, m) for m in metrics]
+        conv = sum(bool(r["converged"]) for r in group)
+        row = "  ".join(f"{c:>{_SUMMARY_COL}}" for c in cells)
+        lines.append(f"{model:<18} {budget:>11} {row}   {conv}/{len(group)}")
+    return "\n".join(lines)
+
+
+def _write_csv(rows: list[dict], path: Path) -> None:
+    """Write ``rows`` as a CSV at ``path`` (parent created if absent)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def main() -> list[dict]:
+    """Run the comparison (default) or the AdamW-budget sweep; return the rows.
+
+    Returns:
+        One metric row per run. The CSV is written into the session
+        directory by default, so successive runs never overwrite one
+        another.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--models",
@@ -1107,53 +1685,150 @@ def main() -> None:
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2, 3, 4])
     parser.add_argument("--smoke", action="store_true", help="tiny-budget wiring check")
     parser.add_argument(
+        "--budget-sweep",
+        nargs="*",
+        type=int,
+        default=None,
+        metavar="EPOCHS",
+        help=(
+            "run the AdamW-budget ablation instead of the main comparison. The "
+            f"bare flag uses {BUDGET_SWEEP_DEFAULT}; pass integers to override. "
+            "Multiplies the run count by the number of budgets, so pair it with "
+            "a reduced --models / --seeds."
+        ),
+    )
+    parser.add_argument(
         "--out",
         type=Path,
-        default=Path(__file__).resolve().parent
-        / "results"
-        / "four_model_comparison.csv",
+        default=None,
+        help=(
+            "CSV path; default is <session dir>/<name>.csv, so a run never "
+            "overwrites an earlier one"
+        ),
+    )
+    parser.add_argument(
+        "--figures-only",
+        type=Path,
+        default=None,
+        metavar="SESSION_DIR",
+        help=(
+            "skip training; re-render the cross-model comparison figures "
+            "from the checkpoints already in this session directory"
+        ),
     )
     args = parser.parse_args()
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.figures_only is not None:
+        paths = render_comparison_figures(args.figures_only, models=args.models)
+        for name, path in paths.items():
+            print(f"{name:<24} {path}")
+        return []
+
+    sweep = args.budget_sweep is not None
     session = Session(
-        name="four-model-comparison",
+        name="four-model-comparison-budget-sweep" if sweep else "four-model-comparison",
         output_root=Path(__file__).resolve().parents[1] / "results" / "logs",
         enable_mlflow=False,
     )
-    tp = _two_phase(args.smoke)
+    session_dir = session.path()  # session root -- the CSV lives here by default
+
+    if sweep:
+        budgets = tuple(args.budget_sweep) or (
+            SMOKE_BUDGET_SWEEP if args.smoke else BUDGET_SWEEP_DEFAULT
+        )
+        session.info(
+            f"budget sweep: models={args.models} seeds={args.seeds} "
+            f"budgets={budgets} smoke={args.smoke}"
+        )
+        session.log_params(
+            {
+                "N": N,
+                "t": T,
+                "delta": DELTA,
+                "budget_sweep": list(budgets),
+                "lbfgs_epochs": _two_phase(args.smoke).lbfgs_epochs,
+                "restore_best": TWO_PHASE_BASE.restore_best,
+                "seeds": args.seeds,
+                "smoke": args.smoke,
+            }
+        )
+        rows = run_budget_sweep(
+            session,
+            models=args.models,
+            seeds=args.seeds,
+            budgets=budgets,
+            smoke=args.smoke,
+        )
+        out = args.out or (session_dir / "four_model_comparison_budget_sweep.csv")
+        _write_csv(rows, out)
+        session.info(f"wrote {out}")
+        print("\n" + summarise_budget_sweep(rows) + "\n")
+        print(f"budget-sweep rows: {out}")
+        return rows
+
+    base_tp = _two_phase(args.smoke)
+
+    def _model_tp(recipe: Recipe) -> TwoPhaseConfig:
+        """Two-phase config for one model: its own AdamW budget, shared rest."""
+        if args.smoke or recipe.adam_epochs is None:
+            return base_tp
+        return replace(base_tp, adam_epochs=recipe.adam_epochs)
+
+    budget_by_model = {n: _model_tp(RECIPES[n]).adam_epochs for n in args.models}
     session.info(
         f"models={args.models} seeds={args.seeds} smoke={args.smoke} "
-        f"(adam {tp.adam_epochs}, lbfgs {tp.lbfgs_epochs})"
+        f"(adam {budget_by_model}, lbfgs {base_tp.lbfgs_epochs})"
     )
     session.log_params(
         {
             "N": N,
             "t": T,
             "delta": DELTA,
-            "adam_epochs": tp.adam_epochs,
-            "lbfgs_epochs": tp.lbfgs_epochs,
+            "adam_epochs": base_tp.adam_epochs,
+            "adam_epochs_per_model": ", ".join(
+                f"{k}={v}" for k, v in budget_by_model.items()
+            ),
+            "lbfgs_epochs": base_tp.lbfgs_epochs,
+            "restore_best": TWO_PHASE_BASE.restore_best,
             "seeds": args.seeds,
             "smoke": args.smoke,
         }
     )
     log_dataset_cards(session, smoke=args.smoke)
 
-    rows: list[dict] = []
+    rows = []
     for model_name in args.models:
         recipe = RECIPES[model_name]
-        log_model_card(session, recipe, args.seeds, smoke=args.smoke)
+        model_tp = _model_tp(recipe)
+        log_model_card(
+            session,
+            recipe,
+            args.seeds,
+            smoke=args.smoke,
+            adam_epochs=model_tp.adam_epochs,
+        )
         for seed in args.seeds:
-            rows.append(run_one(recipe, seed, smoke=args.smoke, session=session))
+            rows.append(
+                run_one(
+                    recipe,
+                    seed,
+                    smoke=args.smoke,
+                    session=session,
+                    two_phase=model_tp,
+                )
+            )
 
-    with args.out.open("w", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    out = args.out or (session_dir / "four_model_comparison.csv")
+    _write_csv(rows, out)
+    session.info(f"wrote {out}")
 
-    session.info(f"wrote {args.out}")
+    figure_paths = render_comparison_figures(session_dir, models=args.models)
+    for name, path in figure_paths.items():
+        session.info(f"comparison figure {name}: {path}")
+
     print("\n" + summarise(rows) + "\n")
-    print(f"per-run rows: {args.out}")
+    print(f"per-run rows: {out}")
+    return rows
 
 
 if __name__ == "__main__":
