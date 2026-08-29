@@ -67,8 +67,10 @@ sampling regions AND the L-BFGS budget (nb 4 ran 100 L-BFGS epochs, nb 3 ran
 After the seed loop, cross-model figures are rendered from the checkpoints
 into ``<session>/figures/comparison/`` -- the headline energy-error panel,
 a spectral-fan context figure and a per-model density waterfall.
-``--figures-only <session dir>`` re-renders just those against an existing
-run without retraining.
+``--figures-only <session dir>`` re-renders those against an existing run
+without retraining, and also refreshes every per-seed
+``figures/<model>/**/seed_*/wavefunctions.png`` from its checkpoint (the
+only per-seed figure that does not need the training history).
 
 Usage:
     python experiments/four_model_comparison.py --smoke
@@ -126,6 +128,7 @@ from kitaev.visualisation import (
     plot_pair_density_waterfall,
     plot_spectral_fan,
     plot_wavefunction_waterfall,
+    rerender_wavefunctions,
     save_run_figures,
     sweep_low_spectrum,
     sweep_spectrum,
@@ -1462,6 +1465,51 @@ def run_budget_sweep(
     return rows
 
 
+def rerender_seed_wavefunctions(
+    session_dir: Path,
+    *,
+    models: list[str],
+    device: str = "cpu",
+) -> list[Path]:
+    """Refresh every per-seed ``wavefunctions.png`` under a finished run.
+
+    Walks each ``figures/<model>/**/seed_*`` directory (the plain layout
+    and the budget sweep's ``adam_<budget>/seed_*`` one), reloads the
+    matching ``checkpoints/<...>/seed_<s>.pt`` and rewrites only the
+    density figure -- the one that consumes ``sweep_wavefunction_grid`` --
+    in place. The rest of the per-seed set needs the training history,
+    which is not checkpointed, so it is left untouched.
+    """
+    hamiltonian = KitaevChainHamiltonian(n_sites=N, hopping=T, pairing=DELTA)
+    two_sided = bool(MU_GRID.min() < 0)
+    written: list[Path] = []
+    for name in models:
+        recipe = RECIPES[name]
+        model_figs = session_dir / "figures" / name
+        if not model_figs.is_dir():
+            continue
+        for seed_dir in sorted(p for p in model_figs.glob("**/seed_*") if p.is_dir()):
+            rel = seed_dir.relative_to(session_dir / "figures")
+            checkpoint = (session_dir / "checkpoints" / rel).with_suffix(".pt")
+            if not checkpoint.exists():
+                continue
+            model = recipe.build_model()
+            model.load_state_dict(
+                torch.load(checkpoint, map_location=device, weights_only=True)
+            )
+            model.eval()
+            written.append(
+                rerender_wavefunctions(
+                    adapter=recipe.build_adapt(model).to(device),
+                    hamiltonian=hamiltonian,
+                    out_dir=seed_dir,
+                    two_sided=two_sided,
+                    device=device,
+                )
+            )
+    return written
+
+
 def render_comparison_figures(
     session_dir: Path,
     *,
@@ -1719,6 +1767,8 @@ def main() -> list[dict]:
     args = parser.parse_args()
 
     if args.figures_only is not None:
+        for path in rerender_seed_wavefunctions(args.figures_only, models=args.models):
+            print(f"{'wavefunctions':<24} {path}")
         paths = render_comparison_figures(args.figures_only, models=args.models)
         for name, path in paths.items():
             print(f"{name:<24} {path}")
