@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import torch
 
-from kitaev.analytical import bdg_block_batched, chiral_block_matvec
+from kitaev.analytical import (
+    bdg_block_batched,
+    chiral_block_batched,
+    chiral_block_matvec,
+)
 
 from . import BaseLoss
 
@@ -655,6 +659,132 @@ class ChiralFSMLoss(BaseLoss):
         }
 
 
+class ChiralSVDLoss(BaseLoss):
+    """Single Frobenius residual for the full SVD of the chiral block.
+
+    Intended for :class:`kitaev.models.SirenPINNChiralFull`, which returns
+    the whole decomposition ``(U, sigma, V)`` of the real ``N x N``
+    bidiagonal operator ``h(mu)`` with ``U`` in ``SO(N)``, ``V`` in
+    ``O(N)`` and ``sigma >= 0`` all structural. Nothing then has to be
+    enforced except that the frames actually diagonalise ``h(mu)``:
+
+        loss = mean( || h(mu) V - U diag(sigma) ||_F^2 )
+
+    Column ``k`` of the residual is ``h(mu) v_k - sigma_k u_k``, so driving
+    it to zero fits every singular triple at once. Unlike
+    :class:`ChiralFSMLoss` there is no folded-spectrum shift (the model is
+    not hunting the smallest singular value) and no eigenvector-consistency
+    term (a matched orthonormal frame is structural), so the residual has
+    no ``<lambda_1^2>`` floor -- it goes to zero when the frames are exact.
+
+    An optional gauge term (default off, ``gauge_weight = 0.0``) adds a
+    finite-difference smoothness penalty
+    ``mean(||U(mu + delta) - U(mu)||^2) + mean(||V(mu + delta) - V(mu)||^2)``
+    that makes the frame reproducible across seeds. Every physical
+    observable (energies, densities, spectrum, subspace fidelity,
+    ``sign(det h)``) is gauge-invariant, so ``gauge_weight = 0`` is the
+    right default for a single run; a small positive value
+    (e.g. ``1e-3``) is used only when cross-seed frame agreement is being
+    measured.
+
+    ``H_base``, ``H_mu_diag``, ``Xi`` and ``epoch`` are accepted for the
+    :class:`BaseLoss` call contract but unused; the loss builds its own
+    ``h(mu)`` from ``mu_batch``.
+
+    Attributes:
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+        gauge_weight: Weight of the optional frame-smoothness term.
+        gauge_delta: Finite-difference step in ``mu`` for that term.
+    """
+
+    def __init__(
+        self,
+        n_sites: int,
+        *,
+        hopping: float = 1.0,
+        pairing: float = 0.5,
+        gauge_weight: float = 0.0,
+        gauge_delta: float = 1e-2,
+    ) -> None:
+        """Initialise the loss with the chain's physical parameters.
+
+        Args:
+            n_sites: Number of physical lattice sites, ``N``.
+            hopping: Nearest-neighbour hopping amplitude, ``t``.
+            pairing: P-wave pairing amplitude, ``delta``.
+            gauge_weight: Weight of the finite-difference frame-smoothness
+                term. ``0.0`` (the default) disables it entirely.
+            gauge_delta: Step in ``mu`` used by the smoothness term.
+        """
+        self.n_sites = n_sites
+        self.hopping = hopping
+        self.pairing = pairing
+        self.gauge_weight = gauge_weight
+        self.gauge_delta = gauge_delta
+
+    def __call__(
+        self,
+        model: torch.nn.Module,
+        mu_batch: torch.Tensor,
+        H_base: torch.Tensor,
+        H_mu_diag: torch.Tensor,
+        Xi: torch.Tensor,
+        epoch: int,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute the full-SVD Frobenius residual for a batch.
+
+        Args:
+            model: The model being trained. Must return an
+                ``(U, sigma, V)`` triple of shapes ``(batch_size, N, N)``,
+                ``(batch_size, N)`` and ``(batch_size, N, N)`` when called
+                on ``mu_batch``.
+            mu_batch: Batch of mu values, shape ``(batch_size, 1)``.
+            H_base: Unused (kept for the :class:`BaseLoss` contract).
+            H_mu_diag: Unused.
+            Xi: Unused.
+            epoch: Unused (this loss has no annealing schedule).
+
+        Returns:
+            Tuple of ``(total_loss, metrics)``, where ``metrics`` holds the
+            Frobenius residual, the mean smallest and largest singular
+            values, an orthogonality tripwire for ``U`` and the optional
+            gauge term with its weight.
+        """
+        del H_base, H_mu_diag, Xi, epoch
+
+        u_mat, sigma, v_mat = model(mu_batch)
+        h_batch = chiral_block_batched(
+            mu_batch, self.n_sites, self.hopping, self.pairing
+        )
+
+        resid = torch.bmm(h_batch, v_mat) - u_mat * sigma.unsqueeze(1)
+        loss_svd = torch.mean(resid**2)
+
+        eye = torch.eye(self.n_sites, device=u_mat.device, dtype=u_mat.dtype)
+        ortho_u = torch.mean((torch.bmm(u_mat.transpose(1, 2), u_mat) - eye) ** 2)
+
+        if self.gauge_weight > 0.0:
+            u_next, _sigma_next, v_next = model(mu_batch + self.gauge_delta)
+            loss_gauge = torch.mean((u_next - u_mat) ** 2) + torch.mean(
+                (v_next - v_mat) ** 2
+            )
+        else:
+            loss_gauge = mu_batch.new_zeros(())
+
+        total_loss = loss_svd + self.gauge_weight * loss_gauge
+
+        return total_loss, {
+            "svd": loss_svd.item(),
+            "sigma_min_mean": sigma.min(dim=1).values.mean().item(),
+            "sigma_max_mean": sigma.max(dim=1).values.mean().item(),
+            "ortho_u": ortho_u.item(),
+            "gauge": loss_gauge.item(),
+            "gauge_wt": self.gauge_weight,
+        }
+
+
 def chiral_pointwise_residual(
     model: torch.nn.Module,
     mu_batch: torch.Tensor,
@@ -700,6 +830,43 @@ def chiral_pointwise_residual(
     var = ((h_v - lam * u) ** 2).sum(dim=1) + ((ht_u - lam * v) ** 2).sum(dim=1)
     residual: torch.Tensor = fsm + var
     return residual
+
+
+def chiral_svd_pointwise_residual(
+    model: torch.nn.Module,
+    mu_batch: torch.Tensor,
+    n_sites: int,
+    *,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+) -> torch.Tensor:
+    """Per-sample full-SVD Frobenius residual for residual-adaptive sampling.
+
+    The per-mu form of the quantity :class:`ChiralSVDLoss` averages into a
+    scalar::
+
+        residual(mu) = || h(mu) V - U diag(sigma) ||_F^2
+
+    with ``(U, sigma, V)`` the model output at ``mu``. Used by
+    :class:`kitaev.training.sampling.AdaptiveSampling` to concentrate
+    collocation on the mu values the full-SVD model currently fits worst.
+
+    Args:
+        model: A model returning ``(U, sigma, V)`` for a mu batch, e.g.
+            :class:`kitaev.models.SirenPINNChiralFull`.
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)``.
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+
+    Returns:
+        A tensor of shape ``(batch_size,)`` of non-negative residuals.
+    """
+    u_mat, sigma, v_mat = model(mu_batch)
+    h_batch = chiral_block_batched(mu_batch, n_sites, hopping, pairing)
+    resid = torch.bmm(h_batch, v_mat) - u_mat * sigma.unsqueeze(1)
+    out: torch.Tensor = (resid**2).flatten(1).sum(dim=1)
+    return out
 
 
 def nambu_pointwise_residual(
