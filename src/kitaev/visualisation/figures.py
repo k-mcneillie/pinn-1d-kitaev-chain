@@ -40,6 +40,7 @@ from .evaluation import (
     LowSpectrumSweep,
     ModelErrorBand,
     MuReflectionSweep,
+    SeedDensitySweep,
     SpectralSweep,
     WavefunctionSweep,
 )
@@ -564,7 +565,10 @@ def plot_model_comparison(
             label=label,
         )
     axes[0].set_yscale("log")
-    axes[0].set_ylim(bottom=max(floor * 0.7, 5e-7))
+    # Follow the data down: the chiral model reaches a few 1e-8 in the
+    # trivial phase, well below the old fixed 5e-7 clamp, which cropped its
+    # median line and IQR band at the axis edge.
+    axes[0].set_ylim(bottom=max(floor * 0.5, 1e-8))
     axes[0].set_title(
         r"$|E_{\rm pred} - E_{\rm exact}|(\mu)$: median, IQR band over seeds"
     )
@@ -829,6 +833,298 @@ def plot_pair_density_waterfall(
     )
     fig.suptitle(
         r"Gauge-invariant pair density $\rho_n(\mu)$", fontsize=13, weight="bold"
+    )
+    _save(fig, save_path, dpi)
+    return fig
+
+
+_DEFAULT_SLICE_MUS_IN_T = (0.0, 0.6, 1.4, 2.6)
+
+
+def _seed_ramp(n_seeds: int) -> list[Any]:
+    """Distinct per-seed colours from viridis, matching the fan animation."""
+    if n_seeds == 1:
+        return [plt.get_cmap("viridis")(0.25)]
+    ramp = plt.get_cmap("viridis")
+    return [ramp(0.08 + 0.84 * i / (n_seeds - 1)) for i in range(n_seeds)]
+
+
+def plot_seed_density_dispersion_maps(
+    sweep: SeedDensitySweep,
+    *,
+    hopping: float,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    r"""Image the inter-seed spread of one model's site density, two ways.
+
+    Two stacked ``site`` :math:`\times` :math:`\mu` heatmaps on a shared
+    colour scale: the standard deviation across seeds of the **raw**
+    particle-plus-hole density, then of the **gauge-invariant** pair
+    density :math:`\rho_n/2`. Where the training objective leaves the
+    near-degenerate Majorana pair unresolved the raw panel carries a
+    bright band inside :math:`|\mu| < 2t` while the gauge-invariant panel
+    stays dark -- the seeds disagree only on the representative, not on
+    the physical subspace. The static counterpart of one model's cross-
+    seed fan animation.
+
+    Args:
+        sweep: A
+            :class:`~kitaev.visualisation.evaluation.SeedDensitySweep`
+            with two or more seeds.
+        hopping: The hopping amplitude ``t``, for the transition markers.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The ``(2, 1)``-panel figure.
+    """
+    use_house_style()
+    mu = np.asarray(sweep.mu, dtype=float)
+    n_sites = len(sweep.sites)
+    extent = (float(mu.min()), float(mu.max()), -0.5, n_sites - 0.5)
+
+    raw_std = sweep.raw_density_std()
+    pair_std = sweep.pair_density_std()
+    vmax = float(np.percentile(np.concatenate([raw_std, pair_std]), 99.0)) or 1.0
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(11, 6.4), sharex=True, sharey=True, layout="constrained"
+    )
+    panels = (
+        (r"raw $|\psi^p_n|^2 + |\psi^h_n|^2$", raw_std),
+        (r"gauge-invariant $\rho_n/2$", pair_std),
+    )
+    images: list[Any] = []
+    for ax, (title, data) in zip(axes, panels, strict=True):
+        images.append(
+            ax.imshow(
+                data.T,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap="magma",
+                vmin=0.0,
+                vmax=vmax,
+            )
+        )
+        ax.grid(False)
+        ax.set_yticks(np.arange(0, n_sites, max(1, n_sites // 5)))
+        for boundary in (-2 * hopping, 2 * hopping):
+            if extent[0] <= boundary <= extent[1]:
+                ax.axvline(boundary, color="white", ls=(0, (4, 3)), lw=1.0)
+        ax.set_title(title)
+        ax.set_ylabel("site $n$")
+    axes[1].set_xlabel(r"$\mu / t$")
+
+    fig.colorbar(
+        images[0],
+        ax=list(axes),
+        location="right",
+        shrink=0.9,
+        pad=0.015,
+        label="std across seeds",
+    )
+    fig.suptitle(
+        f"Cross-seed spread of the site density — {sweep.model_label} "
+        f"({sweep.n_seeds} seeds)",
+        fontsize=13,
+        weight="bold",
+    )
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_seed_density_slices(
+    sweep: SeedDensitySweep,
+    *,
+    hopping: float,
+    mu_values_in_t: Sequence[float] = _DEFAULT_SLICE_MUS_IN_T,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    r"""Per-seed site-density profiles at a few fixed ``mu``, three rows.
+
+    Columns are the chemical-potential slices (nearest grid points to
+    ``mu_values_in_t`` times ``t``); rows are the raw particle sector, the
+    raw hole sector, and the gauge-invariant pair density
+    :math:`\rho_n/2`. Each panel draws one line per seed over the grey
+    exact :math:`\rho_n/2` reference. A frozen snapshot of the fan
+    animation: inside :math:`|\mu| < 2t` the raw rows spread between
+    seeds, the gauge-invariant row collapses onto the reference.
+
+    Args:
+        sweep: A
+            :class:`~kitaev.visualisation.evaluation.SeedDensitySweep`.
+        hopping: The hopping amplitude ``t``.
+        mu_values_in_t: Slice positions in units of ``t``; the nearest
+            available grid point is used for each.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The ``(3, len(mu_values_in_t))``-panel figure.
+    """
+    use_house_style()
+    mu = np.asarray(sweep.mu, dtype=float)
+    sites = np.asarray(sweep.sites)
+    targets = [v * hopping for v in mu_values_in_t]
+    idxs = [int(np.argmin(np.abs(mu - t))) for t in targets]
+    colours = _seed_ramp(sweep.n_seeds)
+
+    topological = np.abs(mu) < 2 * hopping
+    # Particle/hole rows: reference is rho_n/2 inside the phase (a single
+    # representative is arbitrary there) and the lowest eigenvector's own
+    # density outside it. The pair-density row is rho_n/2 everywhere.
+    particle_ref = np.where(
+        topological[:, None], sweep.pair_particle_exact, sweep.raw_particle_exact
+    )
+    hole_ref = np.where(
+        topological[:, None], sweep.pair_hole_exact, sweep.raw_hole_exact
+    )
+    rows = (
+        (r"particle $|\psi^p_n|^2$" + "\n(raw, per seed)", sweep.raw_particle,
+         particle_ref),
+        (r"hole $|\psi^h_n|^2$" + "\n(raw, per seed)", sweep.raw_hole, hole_ref),
+        (r"pair density $\rho_n/2$" + "\n(gauge-invariant, per seed)",
+         sweep.pair_particle + sweep.pair_hole,
+         sweep.pair_particle_exact + sweep.pair_hole_exact),
+    )
+
+    fig, axes = plt.subplots(
+        3,
+        len(idxs),
+        figsize=(3.3 * len(idxs), 8.2),
+        sharex=True,
+        sharey="row",
+        layout="constrained",
+        squeeze=False,
+    )
+    for c, i in enumerate(idxs):
+        phase = "topological" if topological[i] else "trivial"
+        axes[0, c].set_title(
+            f"$\\mu = {mu[i]:+.2f}\\,t$\n({phase})", fontsize=10
+        )
+        for r, (_, per_seed, exact) in enumerate(rows):
+            ax = axes[r, c]
+            ax.fill_between(
+                sites, exact[i], color=INK, alpha=0.14, lw=0,
+                label="exact" if (r, c) == (0, 0) else None,
+            )
+            for s in range(sweep.n_seeds):
+                ax.plot(
+                    sites,
+                    per_seed[s, i],
+                    color=colours[s],
+                    lw=1.2,
+                    label=f"seed {s}" if (r, c) == (0, 0) else None,
+                )
+            ax.grid(True, alpha=0.3)
+    for r, (label, _, _) in enumerate(rows):
+        axes[r, 0].set_ylabel(label, fontsize=9)
+    for c in range(len(idxs)):
+        axes[-1, c].set_xlabel("site $n$")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="lower center", ncol=min(6, sweep.n_seeds + 1),
+        fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.04),
+    )
+    fig.suptitle(
+        f"Per-seed site density at fixed $\\mu$ — {sweep.model_label} "
+        f"({sweep.n_seeds} seeds)",
+        fontsize=13,
+        weight="bold",
+    )
+    _save(fig, save_path, dpi)
+    return fig
+
+
+def plot_seed_edge_weight_envelope(
+    sweeps: Sequence[SeedDensitySweep],
+    *,
+    hopping: float,
+    n_edge_sites: int = 2,
+    save_path: str | Path | None = None,
+    dpi: int = 300,
+) -> Figure:
+    r"""Cross-seed envelope of the left-end weight, raw vs gauge-invariant.
+
+    One panel per model, shading the full inter-seed range (min to max
+    over seeds) of the weight on the ``n_edge_sites`` sites of the **left**
+    end against :math:`\mu`, once for the **raw** per-sector density and
+    once for the **gauge-invariant** pair density :math:`\rho_n/2`, with
+    the exact :math:`\rho_n/2` value on top. The *combined* two-end edge
+    weight is nearly gauge-invariant by itself -- a rotation within the
+    Majorana pair just moves weight between the ends -- so the single-end
+    weight is the scalar that fans: for a model that does not resolve the
+    representative the raw band spans much of :math:`[0, 1]` inside
+    :math:`|\mu| < 2t`, while the :math:`\rho_n/2` band stays pinned near
+    :math:`1/2`.
+
+    Args:
+        sweeps: One
+            :class:`~kitaev.visualisation.evaluation.SeedDensitySweep`
+            per model, in plot order.
+        hopping: The hopping amplitude ``t``.
+        n_edge_sites: Sites counted at the left end of the chain.
+        save_path: If given, the figure is also saved here.
+        dpi: Resolution used when saving.
+
+    Returns:
+        The figure, one panel per model.
+    """
+    use_house_style()
+    sweeps = list(sweeps)
+    n = len(sweeps)
+    ncols = min(n, 2)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(6.6 * ncols, 3.6 * nrows),
+        sharex=True,
+        sharey=True,
+        layout="constrained",
+        squeeze=False,
+    )
+    flat = axes.ravel()
+    left = np.arange(n_edge_sites)
+    for ax, sweep in zip(flat, sweeps, strict=False):
+        mu = np.asarray(sweep.mu, dtype=float)
+        mu_max = float(np.abs(mu).max())
+        for which, colour, name in (
+            ("raw", CORAL, "raw sectors"),
+            ("pair", TEAL, r"gauge-invariant $\rho_n/2$"),
+        ):
+            ew = sweep.edge_weight(which, n_edge_sites=n_edge_sites, end="left")
+            ax.fill_between(
+                mu, ew.min(axis=0), ew.max(axis=0), color=colour, alpha=0.25,
+                lw=0, label=f"{name} (seed range)",
+            )
+            ax.plot(mu, np.median(ew, axis=0), color=colour, lw=1.4)
+        exact_ew = (
+            sweep.pair_particle_exact[:, left].sum(axis=1)
+            + sweep.pair_hole_exact[:, left].sum(axis=1)
+        )
+        ax.plot(mu, exact_ew, color=INK, ls=(0, (4, 3)), lw=1.3, label="exact")
+        mark_transition(
+            ax, hopping=hopping, mu_max=mu_max, two_sided=bool(mu.min() < 0)
+        )
+        ax.set_title(sweep.model_label, fontsize=11)
+        ax.set_xlabel(r"$\mu / t$")
+        ax.set_ylabel("left-end weight")
+    for ax in flat[n:]:
+        ax.set_visible(False)
+    handles, labels = flat[0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="lower center", ncol=3, fontsize=9,
+        frameon=False, bbox_to_anchor=(0.5, -0.04),
+    )
+    fig.suptitle(
+        "Cross-seed spread of the left-end weight — "
+        "raw sectors vs gauge-invariant $\\rho_n/2$",
+        fontsize=13,
+        weight="bold",
     )
     _save(fig, save_path, dpi)
     return fig

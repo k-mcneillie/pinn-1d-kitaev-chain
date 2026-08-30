@@ -68,17 +68,27 @@ class InternalisationProfile:
 KITAEV_PROFILES: dict[str, InternalisationProfile] = {
     "semi_supervised": InternalisationProfile(
         name="semi_supervised",
-        structural_guarantees=("unit norm", "energy non-negative"),
+        # Single-head SirenPINN + SemiSupervisedFSMLoss: only the unit norm
+        # is structural. The energy is the signed Rayleigh quotient
+        # psi^T H psi, pinned to the +E branch by the label on the 700
+        # labelled rows and by evaluation-time alignment elsewhere -- not a
+        # softplus head, so "energy non-negative" is no longer structural.
+        # Same structural content as nambu_baseline; the two differ only in
+        # labels vs the annealed pin.
+        structural_guarantees=("unit norm",),
         penalised_constraints=(
             "eigen-equation",
-            "plus-minus pairing",
+            "energy non-negative",
             "particle-hole partner",
             "evenness in mu",
         ),
-        n_loss_terms=4,  # data E, data psi, residual, particle-hole
+        n_loss_terms=4,  # data E, data psi, fsm, var
         n_tunable_weights=1,  # physics-weight anneal
         raw_output_dim=40,
-        effective_target="a 2N eigenvector, anchored by a few exact labels",
+        effective_target=(
+            "a 2N eigenvector with a Rayleigh-quotient energy, anchored by a "
+            "few exact labels"
+        ),
     ),
     "nambu_baseline": InternalisationProfile(
         name="nambu_baseline",
