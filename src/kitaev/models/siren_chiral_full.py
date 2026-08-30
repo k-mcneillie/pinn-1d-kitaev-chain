@@ -37,6 +37,12 @@ discontinuity is a sign flip of that column where ``sigma_min(mu) = 0``
 subspace fidelity are untouched. ``N`` is assumed even (physical chains), so
 ``s(-mu) = s(mu)`` and the ``mu``-fold bookkeeping is clean.
 
+Device note
+-----------
+``torch.matrix_exp`` has no MPS kernel, so this model runs on CPU or CUDA
+only; on Apple Silicon either force CPU or set
+``PYTORCH_ENABLE_MPS_FALLBACK=1``.
+
 Not built here (documented for later)
 -------------------------------------
 - A truncated ``r``-triple Stiefel / Householder frame for ``N`` in the
