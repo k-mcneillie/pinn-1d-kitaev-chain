@@ -10,7 +10,7 @@ are planned.
   ``(t + Delta) z^2 + mu z + (t - Delta) = 0``.
 - Compare a DeepONet trunk basis against the exact BdG edge and bulk modes.
 
-Neither is implemented here. See ``docs/markdown/xai-methods.md`` for the
+Neither is implemented here. See ``docs/markdown/notes/xai-methods.md`` for the
 intended design.
 """
 
@@ -29,5 +29,5 @@ def fit_localisation_length(*args: object, **kwargs: object) -> None:
     """
     raise NotImplementedError(
         "Symbolic localisation-length read-out is planned for the "
-        "neural-operator phase; see docs/markdown/xai-methods.md."
+        "neural-operator phase; see docs/markdown/notes/xai-methods.md."
     )

@@ -7,12 +7,19 @@ is set by the random seed rather than by the physics. Repeating a model
 over several seeds and measuring how much its output moves therefore maps
 out exactly where its predictions are under-determined.
 
-The observables used here are gauge invariant, so no cross-seed alignment
-is required. The predicted energy is compared through its magnitude, which
-is invariant to the sign branch, and the eigenvector is compared through
-its per-site probability density, which is invariant to both the overall
-sign and, unlike a raw component, is the natural quantity to watch rotate
-as the run moves around the degenerate manifold.
+No cross-seed alignment is required: the predicted energy is compared
+through its magnitude, invariant to the sign branch, and the eigenvector
+through its per-site probability density, invariant to the overall sign.
+Note that inside the topological phase the per-site density of a single
+representative is *not* invariant to rotation within the degenerate
+``+-lambda_1`` pair -- so the ``density_std`` a Nambu-basis model shows
+there is a genuine measure of under-determination, but one confined to
+that gauge degree of freedom rather than to the physical near-zero
+subspace. The gauge-invariant companion -- the pair density ``rho_n/2``
+stacked over seeds, which collapses for every model that found the right
+subspace -- is
+:func:`kitaev.visualisation.evaluation.sweep_seed_densities` and its
+figures.
 """
 
 from __future__ import annotations
@@ -29,13 +36,18 @@ from kitaev.analytical import KitaevChainHamiltonian
 
 @dataclass
 class SeedDispersion:
-    """Standard deviation of gauge-invariant predictions across seeds.
+    """Standard deviation of a model's predictions across seeds, vs ``mu``.
+
+    The energy and edge-weight spreads are gauge-invariant; the raw
+    per-site ``density_std`` is not, inside the topological phase (see the
+    module docstring).
 
     Attributes:
         mu: The chemical-potential grid, shape ``(n_points,)``.
         energy_std: Std across seeds of ``|E_pred(mu)|`` at each ``mu``.
-        density_std_mean: Std across seeds of the per-site probability
-            density, averaged over sites, at each ``mu``.
+        density_std_mean: Std across seeds of the raw per-site probability
+            density, averaged over sites, at each ``mu``. Gauge-dependent
+            for ``|mu| < 2t``.
         density_std_max: The same std, taken at the site where it is
             largest, at each ``mu``.
         edge_weight_std: Std across seeds of the combined edge weight at

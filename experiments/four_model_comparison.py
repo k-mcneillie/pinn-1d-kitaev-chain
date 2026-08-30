@@ -66,7 +66,12 @@ sampling regions AND the L-BFGS budget (nb 4 ran 100 L-BFGS epochs, nb 3 ran
 
 After the seed loop, cross-model figures are rendered from the checkpoints
 into ``<session>/figures/comparison/`` -- the headline energy-error panel,
-a spectral-fan context figure and a per-model density waterfall.
+a spectral-fan context figure, a per-model density waterfall (raw and the
+gauge-invariant pair density), and the static cross-seed density set:
+per-model dispersion maps and fixed-``mu`` seed slices plus a shared
+edge-weight envelope, which show the raw per-sector density scattering
+across seeds inside ``|mu| < 2t`` (an unresolved gauge degree of freedom)
+while the gauge-invariant pair density ``rho_n/2`` stays put.
 ``--figures-only <session dir>`` re-renders those against an existing run
 without retraining, and also refreshes every per-seed
 ``figures/<model>/**/seed_*/wavefunctions.png`` from its checkpoint (the
@@ -123,13 +128,19 @@ from kitaev.training.trainer import _build_kitaev_operators
 from kitaev.visualisation import (
     build_model_error_band,
     fsm_convergence_floor,
+    near_zero_pair_density,
     plot_model_comparison,
     plot_pair_density_waterfall,
+    plot_seed_density_dispersion_maps,
+    plot_seed_density_slices,
+    plot_seed_edge_weight_envelope,
     plot_spectral_fan,
     plot_wavefunction_waterfall,
+    predicted_pair_density,
     rerender_wavefunctions,
     save_run_figures,
     sweep_low_spectrum,
+    sweep_seed_densities,
     sweep_spectrum,
     sweep_wavefunctions,
 )
@@ -1225,16 +1236,10 @@ def _topo_density_maes(adapter: Any, device: str) -> tuple[float, float]:
     pair_gap = np.empty((mu.size, N))
     for i, m in enumerate(mu):
         w, vecs = np.linalg.eigh(hamiltonian.build(float(m)))
-        near = vecs[:, np.argsort(np.abs(w))[:2]]  # exact 2D near-zero basis
-        p_exact = (near[:N, :] ** 2).sum(axis=1)  # projector diagonal, particle
+        p_exact, _ = near_zero_pair_density(w, vecs, N)  # projector diagonal, particle
         ref = vecs[:, N] ** 2  # one eigh representative, all 2N sectors
 
-        u1 = psi[i]
-        u2 = np.concatenate([psi[i, N:], psi[i, :N]])  # Xi @ psi
-        u2 = u2 - (u1 @ u2) * u1
-        nrm = np.linalg.norm(u2)
-        u2 = u2 / nrm if nrm > 1e-9 else u2
-        p_pred = u1[:N] ** 2 + u2[:N] ** 2
+        p_pred, _ = predicted_pair_density(psi[i], N)
 
         pair_gap[i] = np.abs(p_pred - p_exact)
         raw_gap[i] = np.abs(psi[i, :N] ** 2 - ref[:N]) + np.abs(
@@ -1558,6 +1563,7 @@ def render_comparison_figures(
     bands = []
     spectra_repr: dict[str, object] = {}
     repr_checkpoint: dict[str, tuple[object, int]] = {}
+    seed_checkpoints: dict[str, list[Any]] = {}
     for name in models:
         recipe = RECIPES[name]
         checkpoints = load_seed_checkpoints(
@@ -1566,6 +1572,7 @@ def render_comparison_figures(
         if not checkpoints:
             print(f"skip {name}: no checkpoints under {session_dir}")
             continue
+        seed_checkpoints[name] = checkpoints
         sweeps = [
             sweep_spectrum(
                 recipe.build_adapt(model).to(device),
@@ -1623,6 +1630,38 @@ def render_comparison_figures(
         paths[pair_key] = out_dir / f"{pair_key}.png"
         plot_pair_density_waterfall(
             wf, hopping=T, model_label=label, save_path=paths[pair_key]
+        )
+
+    # Cross-seed density figures: the static counterparts of the fan
+    # animation. Per model they show that the raw per-sector density
+    # scatters across seeds inside |mu| < 2t (the unresolved Majorana
+    # representative -- a gauge degree of freedom) while the gauge-
+    # invariant pair density rho_n/2 collapses onto the exact curve.
+    seed_fans = [
+        sweep_seed_densities(
+            [RECIPES[name].build_adapt(m).to(device) for m in seed_checkpoints[name]],
+            hamiltonian,
+            dense_mu,
+            model_label=RECIPES[name].plot_label,
+            device=device,
+        )
+        for name in models
+        if len(seed_checkpoints.get(name, [])) >= 2
+    ]
+    for fan in seed_fans:
+        stem = fan.model_label.lower().replace(" ", "_").replace("/", "_")
+        maps_key = f"seed_density_maps_{stem}"
+        paths[maps_key] = out_dir / f"{maps_key}.png"
+        plot_seed_density_dispersion_maps(
+            fan, hopping=T, save_path=paths[maps_key]
+        )
+        slices_key = f"seed_density_slices_{stem}"
+        paths[slices_key] = out_dir / f"{slices_key}.png"
+        plot_seed_density_slices(fan, hopping=T, save_path=paths[slices_key])
+    if seed_fans:
+        paths["seed_edge_weight_envelope"] = out_dir / "seed_edge_weight_envelope.png"
+        plot_seed_edge_weight_envelope(
+            seed_fans, hopping=T, save_path=paths["seed_edge_weight_envelope"]
         )
 
     return paths

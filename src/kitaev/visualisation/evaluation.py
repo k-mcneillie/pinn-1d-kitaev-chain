@@ -203,6 +203,108 @@ class MuReflectionSweep:
     max_abs_diff: float
 
 
+@dataclass
+class SeedDensitySweep:
+    """Per-seed site densities of one model over a dense ``mu`` grid, two ways.
+
+    Built from every seed's checkpoint of a single model. It carries two
+    parallel views of the same forward passes so a figure can show, side
+    by side, what is a gauge artefact and what is physical:
+
+    - the **raw** per-sector density ``|psi^p_n|^2`` / ``|psi^h_n|^2`` of
+      each seed's unit-normalised prediction. Inside the topological phase
+      (``|mu| < 2t``) the ``+-lambda_1`` pair is degenerate and the
+      folded-spectrum objective is flat over it, so which representative a
+      seed lands on -- and hence this raw split -- is a gauge choice. The
+      seeds fan apart here even when every one of them has solved the
+      physics.
+    - the **gauge-invariant** pair density ``rho_n / 2`` of each seed
+      (:func:`predicted_pair_density`), the diagonal of the projector onto
+      ``span{psi, Xi psi}``. Invariant to any rotation within the
+      degenerate pair, so it collapses onto the exact curve for every
+      model that has found the right near-zero subspace, Nambu-basis
+      models included.
+
+    Both views are normalised the same way: each sector array and its
+    reference sum to ``~1`` when the two sectors are added.
+
+    Attributes:
+        mu: The chemical-potential grid, shape ``(n_mu,)``.
+        sites: Physical site indices, shape ``(n_sites,)``.
+        transition: The topological transition, ``2 * hopping``.
+        model_label: Name of the model these seeds belong to.
+        n_seeds: Number of seeds stacked.
+        raw_particle: Raw particle-sector density per seed, shape
+            ``(n_seeds, n_mu, n_sites)``.
+        raw_hole: Raw hole-sector counterpart, same shape.
+        raw_particle_exact: Reference raw particle density, shape
+            ``(n_mu, n_sites)`` -- the single lowest non-negative ``eigh``
+            eigenvector's density (an arbitrary member of the pair inside
+            the topological phase; shown only to make the gauge spread
+            legible, not as a target there).
+        raw_hole_exact: Hole counterpart, same shape.
+        pair_particle: Gauge-invariant ``rho^p_n / 2`` per seed, shape
+            ``(n_seeds, n_mu, n_sites)``.
+        pair_hole: Hole counterpart, same shape.
+        pair_particle_exact: Exact ``rho^p_n / 2``
+            (:func:`near_zero_pair_density`), shape ``(n_mu, n_sites)``,
+            well defined at every ``mu``.
+        pair_hole_exact: Hole counterpart, same shape.
+    """
+
+    mu: npt.NDArray[np.float64]
+    sites: npt.NDArray[np.int64]
+    transition: float
+    model_label: str
+    n_seeds: int
+    raw_particle: npt.NDArray[np.float64]
+    raw_hole: npt.NDArray[np.float64]
+    raw_particle_exact: npt.NDArray[np.float64]
+    raw_hole_exact: npt.NDArray[np.float64]
+    pair_particle: npt.NDArray[np.float64]
+    pair_hole: npt.NDArray[np.float64]
+    pair_particle_exact: npt.NDArray[np.float64]
+    pair_hole_exact: npt.NDArray[np.float64]
+
+    def raw_density_std(self) -> npt.NDArray[np.float64]:
+        """Inter-seed std of the raw total site density, shape ``(n_mu, n_sites)``."""
+        return (self.raw_particle + self.raw_hole).std(axis=0)
+
+    def pair_density_std(self) -> npt.NDArray[np.float64]:
+        """Inter-seed std of the gauge-invariant site density, ``(n_mu, n_sites)``."""
+        return (self.pair_particle + self.pair_hole).std(axis=0)
+
+    def edge_weight(
+        self, which: str, *, n_edge_sites: int = 2, end: str = "both"
+    ) -> npt.NDArray[np.float64]:
+        """Per-seed edge weight vs ``mu``, shape ``(n_seeds, n_mu)``.
+
+        ``which`` is ``"raw"`` or ``"pair"``; ``end`` is ``"both"``,
+        ``"left"`` or ``"right"``. The weight is the total density on the
+        outermost ``n_edge_sites`` sites of the chosen end(s). The
+        ``"both"`` sum is nearly gauge-invariant on its own (a rotation
+        within the Majorana pair moves weight from one end to the other,
+        leaving the total put), so the ``"left"`` weight is the scalar
+        that actually fans across seeds inside the topological phase.
+        """
+        n_sites = len(self.sites)
+        if end == "both":
+            cols = _edge_sites(n_sites, n_edge_sites)
+        elif end == "left":
+            cols = np.arange(n_edge_sites)
+        elif end == "right":
+            cols = np.arange(n_sites - n_edge_sites, n_sites)
+        else:  # pragma: no cover - guard
+            raise ValueError(f"end must be 'both', 'left' or 'right', got {end!r}")
+        if which == "raw":
+            p, h = self.raw_particle, self.raw_hole
+        elif which == "pair":
+            p, h = self.pair_particle, self.pair_hole
+        else:  # pragma: no cover - guard
+            raise ValueError(f"which must be 'raw' or 'pair', got {which!r}")
+        return p[:, :, cols].sum(axis=2) + h[:, :, cols].sum(axis=2)
+
+
 def _edge_sites(n_sites: int, n_edge_sites: int) -> npt.NDArray[np.int64]:
     """Site indices counted as "edge" at both ends of the chain."""
     return np.concatenate(
@@ -278,7 +380,7 @@ def sweep_energy_and_edge_weight(
     )
 
 
-def _near_zero_pair_density(
+def near_zero_pair_density(
     eigenvalues: npt.NDArray[np.float64],
     eigenvectors: npt.NDArray[np.float64],
     n_sites: int,
@@ -294,15 +396,20 @@ def _near_zero_pair_density(
     falls below machine precision and a single column comes out an
     arbitrary, often one-sided, Majorana combination. Each returned array
     sums to ~1; the two together sum to ~2.
+
+    This is the exact reference for the gauge-invariant pair density; the
+    model counterpart is :func:`predicted_pair_density`. Both are reused
+    by :mod:`kitaev.xai.density_fan` and by the four-model comparison, so
+    there is a single implementation.
     """
     near = eigenvectors[:, np.argsort(np.abs(eigenvalues))[:2]]
     return (near[:n_sites, :] ** 2).sum(axis=1), (near[n_sites:, :] ** 2).sum(axis=1)
 
 
-def _predicted_pair_density(
+def predicted_pair_density(
     psi_pred: npt.NDArray[np.float64], n_sites: int
 ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-    """Model counterpart of :func:`_near_zero_pair_density`.
+    """Model counterpart of :func:`near_zero_pair_density`.
 
     The projector diagonal of ``span{psi, Xi psi}`` (``Xi`` the
     particle-hole swap), Gram-Schmidt orthonormalised. ``{psi, Xi psi}``
@@ -333,8 +440,8 @@ def sweep_wavefunctions(
     density. Inside it (``|mu| < 2t``) the ``+-lambda_1`` pair is
     (near-)degenerate, so a single eigenvector is an arbitrary member of
     the doublet; both sides are then the gauge-invariant pair density
-    ``rho/2`` -- :func:`_near_zero_pair_density` for the reference,
-    :func:`_predicted_pair_density` for the model -- which is the density
+    ``rho/2`` -- :func:`near_zero_pair_density` for the reference,
+    :func:`predicted_pair_density` for the model -- which is the density
     a balanced energy eigenstate carries and is comparable between models.
 
     Args:
@@ -367,10 +474,10 @@ def sweep_wavefunctions(
     for i, mu in enumerate(probe_mus):
         eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
         if abs(mu) < transition:
-            rho_p, rho_h = _near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
+            rho_p, rho_h = near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
             particle_exact[i] = rho_p / 2.0
             hole_exact[i] = rho_h / 2.0
-            pred_p, pred_h = _predicted_pair_density(psi_pred[i], n_sites)
+            pred_p, pred_h = predicted_pair_density(psi_pred[i], n_sites)
             particle_pred[i] = pred_p / 2.0
             hole_pred[i] = pred_h / 2.0
         else:
@@ -387,6 +494,99 @@ def sweep_wavefunctions(
         hole_exact=hole_exact,
         particle_pred=particle_pred,
         hole_pred=hole_pred,
+    )
+
+
+def sweep_seed_densities(
+    models: Sequence[torch.nn.Module],
+    hamiltonian: KitaevChainHamiltonian,
+    mu_grid: npt.NDArray[np.float64],
+    *,
+    model_label: str = "model",
+    device: torch.device | str = "cpu",
+) -> SeedDensitySweep:
+    """Stack one model's site densities over its seeds, raw and gauge-invariant.
+
+    Each element of ``models`` is a trained ``(E, psi)`` model or adapter
+    for the same architecture at a different seed. Every one is evaluated
+    once over ``mu_grid``; the exact reference is diagonalised once. The
+    result feeds the publication figures
+    :func:`kitaev.visualisation.figures.plot_seed_density_dispersion_maps`,
+    :func:`kitaev.visualisation.figures.plot_seed_density_slices` and
+    :func:`kitaev.visualisation.figures.plot_seed_edge_weight_envelope` --
+    the static counterparts of the cross-seed fan animation.
+
+    Args:
+        models: One trained model (or adapter) per seed, same
+            architecture. At least one; two or more for a meaningful
+            spread.
+        hamiltonian: The Hamiltonian the models were trained against.
+        mu_grid: 1D array of chemical-potential values.
+        model_label: Name of the model, kept on the result for titles.
+        device: Device for the forward passes.
+
+    Returns:
+        The populated :class:`SeedDensitySweep`.
+
+    Raises:
+        ValueError: If ``models`` is empty.
+    """
+    if len(models) == 0:
+        raise ValueError("need at least one seed model")
+
+    mu_grid = np.asarray(mu_grid, dtype=float)
+    n_sites = hamiltonian.n_sites
+    n_mu = mu_grid.size
+    sites = np.arange(n_sites)
+    transition = 2.0 * hamiltonian.hopping
+
+    raw_particle_exact = np.zeros((n_mu, n_sites))
+    raw_hole_exact = np.zeros((n_mu, n_sites))
+    pair_particle_exact = np.zeros((n_mu, n_sites))
+    pair_hole_exact = np.zeros((n_mu, n_sites))
+    for i, mu in enumerate(mu_grid):
+        eigenvalues, eigenvectors = np.linalg.eigh(hamiltonian.build(float(mu)))
+        psi = eigenvectors[:, n_sites]
+        raw_particle_exact[i] = psi[:n_sites] ** 2
+        raw_hole_exact[i] = psi[n_sites:] ** 2
+        rho_p, rho_h = near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
+        pair_particle_exact[i] = rho_p / 2.0
+        pair_hole_exact[i] = rho_h / 2.0
+
+    n_seeds = len(models)
+    raw_particle = np.zeros((n_seeds, n_mu, n_sites))
+    raw_hole = np.zeros((n_seeds, n_mu, n_sites))
+    pair_particle = np.zeros((n_seeds, n_mu, n_sites))
+    pair_hole = np.zeros((n_seeds, n_mu, n_sites))
+    mu_tensor = torch.tensor(mu_grid[:, None], dtype=torch.float32, device=device)
+    for s, model in enumerate(models):
+        model.eval()
+        with torch.no_grad():
+            psi_pred = model(mu_tensor)[1].detach().cpu().numpy()
+        psi_pred = psi_pred / np.clip(
+            np.linalg.norm(psi_pred, axis=1, keepdims=True), 1e-12, None
+        )
+        raw_particle[s] = psi_pred[:, :n_sites] ** 2
+        raw_hole[s] = psi_pred[:, n_sites:] ** 2
+        for i in range(n_mu):
+            pred_p, pred_h = predicted_pair_density(psi_pred[i], n_sites)
+            pair_particle[s, i] = pred_p / 2.0
+            pair_hole[s, i] = pred_h / 2.0
+
+    return SeedDensitySweep(
+        mu=mu_grid,
+        sites=sites,
+        transition=transition,
+        model_label=model_label,
+        n_seeds=n_seeds,
+        raw_particle=raw_particle,
+        raw_hole=raw_hole,
+        raw_particle_exact=raw_particle_exact,
+        raw_hole_exact=raw_hole_exact,
+        pair_particle=pair_particle,
+        pair_hole=pair_hole,
+        pair_particle_exact=pair_particle_exact,
+        pair_hole_exact=pair_hole_exact,
     )
 
 
@@ -496,7 +696,7 @@ def sweep_wavefunction_grid(
       (near-)degenerate, so a single eigenvector is an arbitrary,
       frequently one-sided, member of the doublet. Both ``*_exact`` and
       ``*_pred`` are the gauge-invariant pair density ``rho/2`` instead
-      (:func:`_near_zero_pair_density` / :func:`_predicted_pair_density`)
+      (:func:`near_zero_pair_density` / :func:`predicted_pair_density`)
       -- the density a balanced energy eigenstate carries. ``branch`` is
       ``"keep"`` for these columns (no flip is applied). ``manifold_density``
       additionally carries the un-halved ``rho(n) = |psi_+(n)|^2 +
@@ -540,12 +740,12 @@ def sweep_wavefunction_grid(
         psi = psi_pred_all[col]
 
         if abs(mu) < transition:
-            rho_p, rho_h = _near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
+            rho_p, rho_h = near_zero_pair_density(eigenvalues, eigenvectors, n_sites)
             manifold_density[col, 0] = rho_p
             manifold_density[col, 1] = rho_h
             particle_exact[col] = rho_p / 2.0
             hole_exact[col] = rho_h / 2.0
-            pred_p, pred_h = _predicted_pair_density(psi, n_sites)
+            pred_p, pred_h = predicted_pair_density(psi, n_sites)
             particle_pred[col] = pred_p / 2.0
             hole_pred[col] = pred_h / 2.0
             branch.append("keep")
