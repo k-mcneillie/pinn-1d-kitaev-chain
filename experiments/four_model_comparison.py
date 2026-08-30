@@ -14,7 +14,7 @@ its floor on the gauge-invariant metrics (energy, subspace) well inside any
 of these budgets, and the Nambu-basis models' per-site density error in the
 topological phase is under-determined by the objective and so does not
 improve with more epochs (see
-``docs/markdown/under-determination-and-n-scaling.md``). Training each model
+``docs/markdown/derivations/under-determination-and-n-scaling.md``). Training each model
 to its own plateau is therefore the honest choice; the L-BFGS tail is fixed
 across models.
 
@@ -108,7 +108,6 @@ from kitaev.models import (
     RayleighEnergyAdapter,
     SirenPINN,
     SirenPINNChiral,
-    SirenPINNDualHead,
     SirenPINNNambuFolded,
 )
 from kitaev.training import BdGEvaluationProbe, TwoPhaseConfig, run_two_phase
@@ -117,7 +116,7 @@ from kitaev.training.loss import (
     ChiralFSMLoss,
     NambuFSMLoss,
     PinnedFSMLoss,
-    SemiSupervisedLoss,
+    SemiSupervisedFSMLoss,
 )
 from kitaev.training.sampling import SamplingConfig, build_sampling
 from kitaev.training.trainer import _build_kitaev_operators
@@ -548,7 +547,7 @@ RECIPES: dict[str, Recipe] = {
             "2D near-zero Majorana manifold (tie-breaking term ~ lambda_1^2 ~ "
             "e^{-2N/xi}), so the per-mu eigenvector is undetermined; only "
             "subspace-level quantities are meaningful there "
-            "(docs/markdown/topological-eigenvector-ambiguity.md, "
+            "(docs/markdown/derivations/topological-eigenvector-ambiguity.md, "
             "manifold-density-rho.md).",
             "The +-E branch is a gauge (loss_pin dropped); resolved at "
             "evaluation by sign/Xi-alignment to the reference, not "
@@ -712,7 +711,7 @@ RECIPES: dict[str, Recipe] = {
             "Topological phase |mu| < 2t: fsm + var is flat over the 2D "
             "near-zero Majorana manifold, so the per-mu eigenvector is "
             "undetermined; only subspace-level quantities are meaningful "
-            "there (docs/markdown/manifold-density-rho.md).",
+            "there (docs/markdown/derivations/manifold-density-rho.md).",
             "The +-E branch and evenness in mu are both only learned / softly "
             "enforced, never structural; a trivial-phase sign flip or "
             "particle/hole swap is a genuine property of this model.",
@@ -744,81 +743,94 @@ RECIPES: dict[str, Recipe] = {
     ),
     "semi_supervised": Recipe(
         name="semi_supervised",
-        adam_epochs=4000,  # label-driven + restore_best; converges early
+        adam_epochs=4000,  # label-driven; converges early
         two_sided=True,
-        build_model=lambda: SirenPINNDualHead(
-            n_sites=2 * N, hidden_features=64, hidden_layers=3, input_scale=4.0
+        build_model=lambda: SirenPINN(
+            n_sites=2 * N, hidden_features=64, hidden_layers=2, input_scale=4.0
         ),
-        build_loss=lambda tp: SemiSupervisedLoss(
+        build_loss=lambda tp: SemiSupervisedFSMLoss(
             total_epochs=tp.adam_epochs,
             anneal_duration=max(1, tp.adam_epochs // 3),
         ),
-        build_adapt=lambda m: m,  # the dual head already returns (E, psi)
+        build_adapt=lambda m: RayleighEnergyAdapter(
+            m, n_sites=N, hopping=T, pairing=DELTA
+        ),
         build_loaders=lambda smoke: _semisupervised_loaders(smoke),
-        loss_class="SemiSupervisedLoss",
-        plot_label="dual-head PINN (v1)",
-        component_keys=("e", "psi", "res", "ph"),
+        loss_class="SemiSupervisedFSMLoss",
+        plot_label="semi-sup (Rayleigh)",
+        component_keys=("e", "psi", "fsm", "var"),
         weight_key="physics_wt",
-        residual_key="res",
-        fsm_floor_factor=None,  # supervised residual has no E_1^2 floor
-        # The original approach and the only label-consuming model; kept in
-        # the comparison to motivate the move to label-free structural
-        # methods, and evaluated under its intended protocol (best-val).
-        restore_best=True,
+        residual_key="var",
+        fsm_floor_factor=1.0,  # Nambu single-term folded-spectrum floor <E_1^2>
+        # The one label-consuming model, kept to show what a handful of exact
+        # labels buys over a pure physics residual. Same SirenPINN backbone
+        # and Rayleigh-quotient energy as nambu_baseline; only the loss
+        # differs (labels + anneal vs the four-term pin). Scored at the
+        # final epoch like the label-free models (restore_best=False): the
+        # physics-weight anneal makes early epochs an artificial validation-loss
+        # minimum (the physics residual is still discounted there), so
+        # restore_best would roll back to a barely-physics-trained checkpoint.
+        restore_best=False,
         structural_fold=False,
         card_architecture=(
-            "SIREN coordinate backbone with two linear heads: a scalar energy "
-            "head through softplus (E >= 0 structural) and a 2N eigenvector "
-            "head, L2-normalised. No mu-fold. Trained on the full [-4t, 4t] "
-            "domain against a small exact-label set plus a large label-free "
-            "collocation stream."
+            "SIREN coordinate backbone; one linear head -> 2N Nambu-basis BdG "
+            "eigenvector, L2-normalised. No mu-fold: trained on the full "
+            "[-4t, 4t] domain against a small exact-label set plus a large "
+            "label-free collocation stream. Energy is the Rayleigh quotient "
+            "psi^T H(mu) psi (RayleighEnergyAdapter), not a head output; the "
+            "+E branch is pinned exactly on the labelled rows by the energy "
+            "label and is a gauge elsewhere. Identical architecture to "
+            "nambu_baseline -- only the loss differs."
         ),
         card_static_parameters={
             **_SIREN_STATIC,
-            "hidden_layers": 3,
-            "hidden_omega_0": 2.0,  # SirenPINNDualHead's default, unlike the others
             "n_sites_arg": 2 * N,
             "output_dim": 2 * N,
-            "energy_head": "Linear(hidden -> 1) then softplus(beta=10)",
-            "energy_softplus_beta": 10.0,
             "fold": "none (full-domain training over [-4t, 4t])",
-            "structural_guarantees": ["||psi|| = 1", "E >= 0 (softplus head)"],
+            "structural_guarantees": ["||psi|| = 1"],
         },
         card_intended_use=[
             "Semi-supervised continuous surrogate for the lowest-|E| BdG "
             "eigenpair of the 1D Kitaev chain vs mu over -4t < mu < 4t.",
-            "The labelled-anchor rung of the four-model journey (semi-sup -> "
-            "unsupervised -> basis + loss reduction -> operator): what a "
-            "handful of exact eigh labels buys over a pure physics residual.",
+            "The label-anchored rung of the four-model study: what a handful "
+            "of exact eigh labels buys over a pure physics residual, on the "
+            "same backbone and energy mechanism as the label-free baseline.",
             "Energy, gap, edge weight, near-zero subspace fidelity; per-mu psi "
-            "in the trivial phase (the labels fix its sign there).",
+            "in the trivial phase (the global-sign label fixes its branch "
+            "there).",
         ],
         card_limitations=[
             "Needs exact labels: N_LABELLED_TRAIN exact diagonalisations, "
             "gauge-fixed for sign continuity, are computed up front.",
             "The psi label MSE only breaks the overall sign of psi; it does "
             "not resolve the 2D topological-phase manifold ambiguity, so "
-            "per-mu topological eigenvectors remain under-determined.",
+            "per-mu topological eigenvectors remain under-determined with or "
+            "without labels.",
             "physics_weight anneals 0.01 -> 1.0 (over 1/3 of the AdamW "
-            "epochs) -- another schedule to tune; loss_ph is carried despite "
-            "being redundant with loss_res.",
-            "+-E spectral pairing and evenness in mu are only learned; class "
-            "BDI (real Kitaev chain) only.",
+            "epochs) -- a schedule to tune.",
+            "The +-E branch is exact only on the labelled rows (via loss_e); "
+            "off them it is a gauge fixed at evaluation. Evenness in mu is "
+            "learned, not structural. Class BDI (real Kitaev chain) only.",
         ],
         card_loss={
-            "class": "SemiSupervisedLoss",
+            "class": "SemiSupervisedFSMLoss",
             "terms": {
-                "e": "mse(E_pred, E_exact) on labelled rows",
+                "e": "mse(E_R, E_exact) on labelled rows, E_R = psi^T H(mu) psi",
                 "psi": "mse(psi_pred, sign-aligned psi_exact) on labelled rows",
-                "res": "mean(||H psi_pred - E_pred psi_pred||^2), all rows",
-                "ph": "mean(||H (Xi psi_pred) + E_pred (Xi psi_pred)||^2)  [== res]",
+                "fsm": "mean(||H(mu) psi_pred||^2), all rows",
+                "var": "mean(||H(mu) psi_pred - E_R psi_pred||^2), all rows",
             },
-            "total": "e + psi + w_phys(epoch) * (res + ph)",
+            "total": "e + psi + w_phys(epoch) * (fsm + var)",
             "schedule": (
                 "w_phys anneals 0.01 -> 1.0 linearly over anneal_duration "
                 "(= adam_epochs // 3), then holds at 1.0"
             ),
-            "relative_weights": "e, psi unweighted; res + ph share w_phys",
+            "relative_weights": "e, psi unweighted; fsm + var share w_phys",
+            "dropped_vs_SemiSupervisedLoss": [
+                "energy head + softplus (energy is the Rayleigh quotient; "
+                "E >= 0 is a branch gauge, not a head)",
+                "loss_ph  (== var identically; Xi H Xi = -H, Xi orthogonal)",
+            ],
             "data": {
                 "labelled_train": N_LABELLED_TRAIN,
                 "labelled_val": N_LABELLED_VAL,
@@ -829,15 +841,19 @@ RECIPES: dict[str, Recipe] = {
             },
         },
         card_description=(
-            "SirenPINNDualHead + SemiSupervisedLoss. A few exact labels plus a "
-            "label-free physics residual; E >= 0 and ||psi|| = 1 structural, "
-            "the rest penalised with one annealed weight."
+            "SirenPINN + SemiSupervisedFSMLoss. A few exact labels anchor a "
+            "Rayleigh-quotient energy and the global psi sign; a label-free "
+            "folded-spectrum residual (fsm + var) does the rest under one "
+            "annealed weight. Only ||psi|| = 1 is structural. Same backbone "
+            "as nambu_baseline."
         ),
     ),
 }
 
-# The narrative order of the study: constraints migrating loss -> architecture
-# -> representation. Used as the default --models list and the summary order.
+# The narrative order of the study: remove crutches (labels: semi_supervised
+# -> nambu_baseline), localise the failure (structural_nambu, the diagnostic
+# control that rules out loss design), then fix it by representation (chiral).
+# Used as the default --models list and the summary order.
 MODEL_ORDER = ("semi_supervised", "nambu_baseline", "structural_nambu", "chiral")
 
 
@@ -878,9 +894,9 @@ def log_dataset_cards(session: Session, *, smoke: bool) -> None:
             FULL_BATCH,
             "[-4, 4] t  (two-sided models with no mu-fold)",
             "Mirror of the half-domain mixture for the two-sided models "
-            "(SirenPINN, and SirenPINNDualHead's label-free stream), which "
-            "have no structural fold; batch doubled to match collocation "
-            "density.",
+            "(SirenPINN, including the semi-supervised model's label-free "
+            "stream), which have no structural fold; batch doubled to match "
+            "collocation density.",
         ),
     ):
         session.log_dataset_card(
@@ -1280,7 +1296,7 @@ def run_one(
         mu_grid=MU_GRID,
         every=2 if smoke else 50,
         session=session,
-        adapt=adapt,  # identity for the dual head; a real wrapper otherwise
+        adapt=adapt,  # RayleighEnergyAdapter / ChiralToBdGAdapter per recipe
     )
 
     t0 = time.perf_counter()
