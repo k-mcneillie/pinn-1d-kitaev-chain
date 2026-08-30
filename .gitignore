@@ -25,6 +25,7 @@ notebooks/legacy
 .mypy_cache/
 .ruff_cache/
 .coverage
+coverage.xml
 htmlcov/
 dist/
 build/
