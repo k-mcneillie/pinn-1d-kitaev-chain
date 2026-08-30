@@ -14,11 +14,13 @@ from kitaev.analytical import (
     reconstruct_bdg_eigenvector,
 )
 from kitaev.models import (
+    ChiralFullToBdGAdapter,
     ChiralToBdGAdapter,
     RayleighEnergyAdapter,
     SirenPINNChiral,
+    SirenPINNChiralFull,
 )
-from kitaev.training.probes import BdGEvaluationProbe
+from kitaev.training.probes import BdGEvaluationProbe, SpectrumEvaluationProbe
 from kitaev.training.utils import TrainingHistory
 
 N_SITES = 8
@@ -310,6 +312,151 @@ def test_probe_phase_split_uses_absolute_mu() -> None:
     assert math.isnan(history["probe_e_mae_topological"][-1])
     assert not math.isnan(history["probe_e_mae_trivial"][-1])
     assert history["probe_e_mae_trivial"][-1] == pytest.approx(0.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# SpectrumEvaluationProbe
+# ---------------------------------------------------------------------------
+
+SPECTRUM_PROBE_KEYS = {
+    "probe_spectrum_epoch",
+    "probe_spectrum_mae",
+    "probe_spectrum_mae_nearzero",
+    "probe_spectrum_mae_bulk",
+    "probe_spectrum_max_abs",
+}
+
+
+def _exact_spectrum(model: torch.nn.Module, mu_tensor: torch.Tensor) -> torch.Tensor:
+    """Ignores the model; returns the exact sorted 2N spectrum per mu."""
+    del model
+    ham = KitaevChainHamiltonian(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+    rows = [
+        np.sort(np.linalg.eigvalsh(ham.build(float(mu))))
+        for mu in mu_tensor.reshape(-1).tolist()
+    ]
+    return torch.tensor(np.array(rows), dtype=mu_tensor.dtype)
+
+
+def _exact_spectrum_but_inner_pair_wrong(
+    model: torch.nn.Module, mu_tensor: torch.Tensor
+) -> torch.Tensor:
+    # Nudge only the innermost +-lambda_1 pair, by a margin small enough
+    # that the sorted order is unchanged (kept below the bulk gap ~ t).
+    spectrum = _exact_spectrum(model, mu_tensor)
+    spectrum[:, N_SITES - 1] -= 0.01
+    spectrum[:, N_SITES] += 0.01
+    return spectrum
+
+
+def _spectrum_probe(**overrides) -> SpectrumEvaluationProbe:
+    kwargs = {
+        "n_sites": N_SITES,
+        "spectrum": _exact_spectrum,
+        "hopping": HOPPING,
+        "pairing": PAIRING,
+        # Topological phase only: the innermost pair is well below the bulk
+        # gap, so a small nudge cannot reorder the sorted spectrum.
+        "mu_grid": np.linspace(0.1, 1.9, 30),
+        "every": 3,
+    }
+    kwargs.update(overrides)
+    return SpectrumEvaluationProbe(**kwargs)
+
+
+def _dummy_model() -> torch.nn.Module:
+    return SirenPINNChiralFull(n_sites=N_SITES, hidden_features=8, hidden_layers=1)
+
+
+def test_spectrum_probe_default_grid_spans_the_valid_half_domain() -> None:
+    probe = SpectrumEvaluationProbe(
+        n_sites=N_SITES, spectrum=_exact_spectrum, hopping=HOPPING, pairing=PAIRING
+    )
+    assert probe.mu_grid.shape == (200,)
+    assert probe.mu_grid[0] == pytest.approx(0.05)
+    assert probe.mu_grid[-1] == pytest.approx(4.0 * HOPPING)
+
+
+def test_spectrum_probe_caches_the_exact_2n_spectrum() -> None:
+    grid = np.linspace(0.1, 4.0, 20)
+    probe = _spectrum_probe(mu_grid=grid)
+    ham = KitaevChainHamiltonian(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+
+    assert probe._spectrum_exact.shape == (20, 2 * N_SITES)
+    expected = np.sort(np.linalg.eigvalsh(ham.build(float(grid[7]))))
+    assert np.allclose(probe._spectrum_exact[7], expected)
+
+
+def test_spectrum_probe_fires_on_first_epoch_then_every_interval() -> None:
+    probe = _spectrum_probe(every=3)
+    model = _dummy_model()
+    history = TrainingHistory()
+
+    for epoch in range(1, 8):
+        probe.on_epoch_end(epoch, model, history)
+
+    assert history["probe_spectrum_epoch"] == [1.0, 3.0, 6.0]
+
+
+def test_spectrum_probe_records_every_key_and_is_zero_for_exact_spectrum() -> None:
+    probe = _spectrum_probe(every=1)
+    model = _dummy_model()
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    for key in SPECTRUM_PROBE_KEYS:
+        assert key in history
+    # float32 mu rounding in the probe forward leaves a ~1e-7 floor.
+    assert history["probe_spectrum_mae"][-1] == pytest.approx(0.0, abs=1e-6)
+    assert history["probe_spectrum_mae_bulk"][-1] == pytest.approx(0.0, abs=1e-6)
+    assert history["probe_spectrum_mae_nearzero"][-1] == pytest.approx(0.0, abs=1e-6)
+    assert history["probe_spectrum_max_abs"][-1] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_spectrum_probe_isolates_the_near_zero_pair_error() -> None:
+    probe = _spectrum_probe(every=1, spectrum=_exact_spectrum_but_inner_pair_wrong)
+    model = _dummy_model()
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    # Only the innermost +-lambda_1 pair is off, by 0.01 each.
+    assert history["probe_spectrum_mae_bulk"][-1] == pytest.approx(0.0, abs=1e-6)
+    assert history["probe_spectrum_mae_nearzero"][-1] == pytest.approx(0.01, abs=1e-6)
+    assert history["probe_spectrum_max_abs"][-1] == pytest.approx(0.01, abs=1e-6)
+
+
+def test_spectrum_probe_scores_the_full_svd_model_through_its_adapter() -> None:
+    def spectrum(model: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return ChiralFullToBdGAdapter(
+            model, hopping=HOPPING, pairing=PAIRING
+        ).full_spectrum(x)
+
+    probe = _spectrum_probe(every=1, spectrum=spectrum)
+    model = _dummy_model()
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    for key in SPECTRUM_PROBE_KEYS:
+        assert math.isfinite(history[key][-1])
+
+
+def test_spectrum_probe_writes_to_session_and_restores_training_flag() -> None:
+    session = _RecordingSession()
+    probe = _spectrum_probe(every=1, session=session)
+    model = _dummy_model()
+
+    model.train()
+    probe.on_epoch_end(1, model, history=TrainingHistory())
+    assert model.training is True
+    assert len(session.messages) == 1
+    assert "spectrum probe" in session.messages[0]
+
+    model.eval()
+    probe.on_epoch_end(2, model, history=TrainingHistory())
+    assert model.training is False
 
 
 if __name__ == "__main__":

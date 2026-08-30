@@ -54,6 +54,10 @@ if TYPE_CHECKING:
 #: returns ``(E_pred, psi_pred)``.
 ModelAdapter = Callable[[torch.nn.Module], torch.nn.Module]
 
+#: A callable mapping ``(model, mu_grid_tensor)`` to the model's predicted
+#: full BdG spectrum, shape ``(n_mu, 2 * n_sites)``.
+SpectrumMap = Callable[[torch.nn.Module, torch.Tensor], torch.Tensor]
+
 
 class BdGEvaluationProbe(TrainingCallback):
     """Records energy / edge-weight / eigenvector errors against ``eigh``.
@@ -235,3 +239,139 @@ def _safe_mean(values: npt.NDArray[np.float64], mask: npt.NDArray[np.bool_]) -> 
     if not mask.any():
         return float("nan")
     return float(values[mask].mean())
+
+
+class SpectrumEvaluationProbe(TrainingCallback):
+    """Records the whole predicted BdG spectrum against ``eigvalsh``.
+
+    :class:`BdGEvaluationProbe` scores only the lowest eigenpair, which is
+    all the four soft-constraint models predict. A model that emits every
+    singular value of the chiral block -- :class:`kitaev.models.SirenPINNChiralFull`
+    via :meth:`kitaev.models.ChiralFullToBdGAdapter.full_spectrum` -- can be
+    scored on the full ``2N`` spectrum as well. This
+    :class:`~kitaev.training.callbacks.TrainingCallback` evaluates the model
+    on a fixed ``mu`` grid every ``every`` epochs and appends, under the
+    ``probe_spectrum_*`` keys:
+
+    - ``probe_spectrum_mae``: mean absolute error over the grid and all
+      ``2N`` levels;
+    - ``probe_spectrum_mae_nearzero``: the same restricted to the innermost
+      ``+-lambda_1`` pair, where the finite-size splitting lives;
+    - ``probe_spectrum_mae_bulk``: the same over the other ``2N - 2``
+      levels;
+    - ``probe_spectrum_max_abs``: the worst single level / ``mu``;
+    - ``probe_spectrum_epoch``: the cumulative evaluation index, kept on the
+      instance so one probe shared across both :func:`run_two_phase` phases
+      gives a continuous axis.
+
+    It runs alongside :class:`BdGEvaluationProbe` in the same ``callbacks``
+    list. The exact spectrum is diagonalised once, at construction.
+
+    Args:
+        n_sites: Number of physical lattice sites, ``N``.
+        spectrum: Callable mapping ``(model, mu_grid_tensor)`` to the
+            predicted spectrum, shape ``(n_mu, 2 * n_sites)``. For the
+            full-SVD model pass ``lambda m, x: ChiralFullToBdGAdapter(
+            m, hopping=t, pairing=d).full_spectrum(x)``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+        mu_grid: Grid to evaluate on. Defaults to 200 points spanning
+            ``[0.05, 4 t]``.
+        every: Epoch interval between evaluations. The first epoch is always
+            evaluated.
+        session: Optional :class:`sesh.Session`; each evaluation is also
+            written to the run log when given.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_sites: int,
+        spectrum: SpectrumMap,
+        hopping: float = 1.0,
+        pairing: float = 0.5,
+        mu_grid: npt.NDArray[np.float64] | None = None,
+        every: int = 100,
+        session: Session | None = None,
+    ) -> None:
+        """Diagonalise the exact spectrum once and cache it."""
+        self.n_sites = n_sites
+        self.spectrum = spectrum
+        self.hopping = hopping
+        self.pairing = pairing
+        self.every = every
+        self.session = session
+
+        if mu_grid is None:
+            mu_grid = np.linspace(0.05, 4.0 * hopping, 200)
+        self.mu_grid = np.asarray(mu_grid, dtype=float)
+
+        hamiltonian = KitaevChainHamiltonian(
+            n_sites=n_sites, hopping=hopping, pairing=pairing
+        )
+        grid_size = self.mu_grid.shape[0]
+        self._spectrum_exact = np.zeros((grid_size, 2 * n_sites))
+        for i, mu in enumerate(self.mu_grid):
+            self._spectrum_exact[i] = np.sort(
+                np.linalg.eigvalsh(hamiltonian.build(float(mu)))
+            )
+
+        self._near_zero_cols = np.array([n_sites - 1, n_sites])
+        self._bulk_cols = np.array(
+            [j for j in range(2 * n_sites) if j not in (n_sites - 1, n_sites)]
+        )
+        self._calls = 0
+
+    def on_epoch_end(
+        self,
+        epoch: int,
+        model: torch.nn.Module,
+        history: TrainingHistory,
+    ) -> None:
+        """Evaluate and record on the first epoch and every ``every`` after."""
+        del epoch
+        self._calls += 1
+        if self._calls != 1 and self._calls % self.every != 0:
+            return
+        self._evaluate(model, history)
+
+    def _evaluate(
+        self,
+        model: torch.nn.Module,
+        history: TrainingHistory,
+    ) -> None:
+        """Run one forward sweep and append the ``probe_spectrum_*`` metrics."""
+        was_training = model.training
+        model.eval()
+        device = next(model.parameters()).device
+        with torch.no_grad():
+            mu_tensor = torch.tensor(
+                self.mu_grid[:, None], dtype=torch.float32, device=device
+            )
+            spectrum_pred_t = self.spectrum(model, mu_tensor)
+        if was_training:
+            model.train()
+
+        spectrum_pred = np.sort(spectrum_pred_t.detach().cpu().numpy(), axis=1)
+        abs_err = np.abs(spectrum_pred - self._spectrum_exact)
+
+        metrics = {
+            "probe_spectrum_epoch": float(self._calls),
+            "probe_spectrum_mae": float(abs_err.mean()),
+            "probe_spectrum_mae_nearzero": float(
+                abs_err[:, self._near_zero_cols].mean()
+            ),
+            "probe_spectrum_mae_bulk": float(abs_err[:, self._bulk_cols].mean()),
+            "probe_spectrum_max_abs": float(abs_err.max()),
+        }
+        for key, value in metrics.items():
+            history.record(key, value)
+
+        if self.session is not None:
+            self.session.info(
+                f"spectrum probe | step {self._calls:>5d} | "
+                f"MAE {metrics['probe_spectrum_mae']:.3e} "
+                f"(near-zero {metrics['probe_spectrum_mae_nearzero']:.3e}, "
+                f"bulk {metrics['probe_spectrum_mae_bulk']:.3e}) | "
+                f"max {metrics['probe_spectrum_max_abs']:.3e}"
+            )
