@@ -127,7 +127,7 @@ class NambuFSMLoss(BaseLoss):
     - ``loss_ph``: ``Xi H Xi = -H`` with ``Xi`` orthogonal makes the
       particle-hole residual numerically equal to ``loss_var`` term by
       term, so it carries no independent gradient (see
-      ``docs/markdown/particle-hole-redundancy.md``).
+      ``docs/markdown/derivations/particle-hole-redundancy.md``).
     - ``loss_pin``: ``loss_fsm + loss_var`` is exactly invariant under
       ``psi -> Xi psi`` (which sends ``E_R -> -E_R``), so the ``+-E`` branch
       is an unbroken global gauge. It is resolved at *evaluation* time by
@@ -348,6 +348,191 @@ class SemiSupervisedLoss(BaseLoss):
             "psi": loss_psi.item(),
             "res": loss_res.item(),
             "ph": loss_ph.item(),
+            "physics_wt": physics_weight,
+        }
+
+
+class SemiSupervisedFSMLoss(BaseLoss):
+    """Label-anchored folded-spectrum loss for a single-head Nambu model.
+
+    The label-free, single-head, Rayleigh-quotient counterpart of
+    :class:`SemiSupervisedLoss`. Where :class:`SemiSupervisedLoss` drives a
+    dual-head model (a softplus energy head plus an eigenvector head), this
+    loss drives a bare :class:`kitaev.models.SirenPINN`: the model returns
+    only a ``(batch_size, 2N)`` unit-norm Nambu eigenvector ``psi_pred``,
+    and the energy is the Rayleigh quotient
+    ``E_R = psi_pred^T H(mu) psi_pred`` -- exactly the energy mechanism of
+    :class:`NambuFSMLoss`, :class:`PinnedFSMLoss` and :class:`ChiralFSMLoss`.
+
+    ``mu_batch`` is expected to be the concatenation of a labelled block
+    followed by a label-free block: the first ``energy_batch.shape[0]``
+    rows carry exact ``(E, psi)`` targets, the rest do not. The two physics
+    residual terms are evaluated over the *whole* batch; the two data terms
+    are restricted to the labelled rows::
+
+        loss = loss_e + loss_psi + w_phys(epoch) * (loss_fsm + loss_var)
+
+    loss_fsm:
+        ``mean(||H(mu) psi_pred||^2)`` over all rows -- the folded-spectrum
+        residual. Identical to :class:`NambuFSMLoss`'s ``loss_fsm``.
+    loss_var:
+        ``mean(||H(mu) psi_pred - E_R psi_pred||^2)`` over all rows, with
+        ``E_R`` the Rayleigh quotient. Forces ``psi_pred`` to be a genuine
+        eigenvector, so ``E_R`` is a meaningful energy. Identical to
+        :class:`NambuFSMLoss`'s ``loss_var``.
+    loss_e:
+        ``mse(E_R, E_exact)`` on the labelled rows. Anchors ``E_R`` to the
+        exact lowest non-negative eigenvalue, so on those rows it also pins
+        the ``+E`` branch exactly -- the job :class:`PinnedFSMLoss` does
+        softly with its annealed ``loss_pin`` term.
+    loss_psi:
+        ``mse(psi_pred, sign-aligned psi_exact)`` on the labelled rows,
+        with ``psi_exact``'s sign matched to ``psi_pred`` per row before
+        the comparison. Identical to :class:`SemiSupervisedLoss`'s
+        ``loss_psi``: an eigenvector is defined only up to an overall sign
+        and nothing else here breaks that, so this term must. It breaks the
+        *global* ``psi`` sign only; it does not resolve the 2D near-zero
+        Majorana manifold in the topological phase, which is
+        under-determined with or without labels.
+
+    Early in training ``psi_pred`` is close to random, so the physics
+    residual terms (computed *from that prediction*, not from ground truth)
+    are an unreliable signal. ``w_phys`` therefore anneals from ``0.01`` up
+    to ``1.0`` over ``anneal_duration`` epochs -- the mirror image of
+    :class:`PinnedFSMLoss`'s ``pin_weight`` schedule and identical to
+    :class:`SemiSupervisedLoss`'s -- so the model first locks onto the
+    labelled data before the physics constraints reach full strength.
+    ``loss_e``/``loss_psi`` are left unweighted throughout, being exact
+    ground truth wherever they are available at all.
+
+    Passing ``energy_batch=None``/``psi_batch=None`` drops the two data
+    terms, leaving a pure label-free ``w_phys * (loss_fsm + loss_var)``
+    physics loss usable on an unsupervised-only batch.
+
+    Dropped relative to :class:`SemiSupervisedLoss`:
+
+    - the energy head and its softplus: the energy is the Rayleigh
+      quotient, and its non-negativity is a branch gauge fixed at
+      evaluation, not a structural head output.
+    - ``loss_ph``: with ``Xi`` orthogonal and ``Xi H Xi = -H`` the
+      particle-hole residual is numerically equal to ``loss_var`` term by
+      term, so it carries no independent gradient (see
+      ``docs/markdown/derivations/particle-hole-redundancy.md``).
+
+    ``Xi`` is accepted only for the :class:`BaseLoss` call contract and is
+    unused: this loss has no ``Xi`` term.
+
+    Attributes:
+        total_epochs: Total number of epochs the associated training run
+            is expected to last.
+        anneal_duration: Number of epochs over which ``w_phys`` rises from
+            ``0.01`` to ``1.0``.
+    """
+
+    def __init__(
+        self,
+        total_epochs: int = 3000,
+        anneal_duration: int = 2000,
+    ) -> None:
+        """Initialises the loss with its annealing schedule.
+
+        Args:
+            total_epochs: Total number of epochs the associated training
+                run is expected to last.
+            anneal_duration: Number of epochs over which ``w_phys`` rises
+                from ``0.01`` to ``1.0``.
+        """
+        self.total_epochs = total_epochs
+        self.anneal_duration = anneal_duration
+
+    def __call__(
+        self,
+        model: torch.nn.Module,
+        mu_batch: torch.Tensor,
+        H_base: torch.Tensor,
+        H_mu_diag: torch.Tensor,
+        Xi: torch.Tensor,
+        epoch: int,
+        energy_batch: torch.Tensor | None = None,
+        psi_batch: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Computes the label-anchored folded-spectrum loss for a batch.
+
+        Args:
+            model: The single-head model being trained. Must return a
+                ``(batch_size, 2N)`` unit-norm Nambu eigenvector when
+                called on ``mu_batch`` (e.g.
+                :class:`kitaev.models.SirenPINN`).
+            mu_batch: Batch of mu values, shape ``(batch_size, 1)``. Rows
+                ``[:n_labeled]`` must correspond, in order, to
+                ``energy_batch``/``psi_batch`` when those are given.
+            H_base: Mu-independent part of the batched Hamiltonian.
+            H_mu_diag: Diagonal matrix such that
+                ``H_base + mu * H_mu_diag`` gives ``H(mu)``.
+            Xi: Unused (kept for the :class:`BaseLoss` contract).
+            epoch: Current epoch number, used to anneal ``w_phys``.
+            energy_batch: Exact energies for the labelled rows of
+                ``mu_batch``, shape ``(n_labeled, 1)``. ``None`` disables
+                ``loss_e``.
+            psi_batch: Exact eigenvectors for the labelled rows of
+                ``mu_batch``, shape ``(n_labeled, 2 * n_sites)``. ``None``
+                disables ``loss_psi``.
+
+        Returns:
+            Tuple of ``(total_loss, metrics)``, where ``metrics`` holds the
+            four unweighted loss components, the mean absolute
+            Rayleigh-quotient energy (``lam_mean``) and the current
+            ``physics_wt``.
+        """
+        del Xi
+
+        if epoch < self.anneal_duration:
+            physics_weight = 0.01 + 0.99 * (epoch / self.anneal_duration)
+        else:
+            physics_weight = 1.0
+
+        psi_pred = model(mu_batch)
+        H_batch = H_base.unsqueeze(0) + mu_batch.unsqueeze(-1) * H_mu_diag.unsqueeze(0)
+
+        H_psi = torch.bmm(H_batch, psi_pred.unsqueeze(-1)).squeeze(-1)
+        loss_fsm = torch.mean(H_psi**2)
+
+        E_rayleigh = torch.sum(psi_pred * H_psi, dim=1, keepdim=True)
+        loss_var = torch.mean((H_psi - E_rayleigh * psi_pred) ** 2)
+
+        if energy_batch is not None and psi_batch is not None:
+            n_labeled = energy_batch.shape[0]
+            loss_e = torch.nn.functional.mse_loss(E_rayleigh[:n_labeled], energy_batch)
+
+            # An eigenvector is only defined up to an overall sign, and
+            # nothing else in this loss breaks that ambiguity: loss_fsm and
+            # loss_var are both invariant under psi_pred -> -psi_pred (the
+            # residual flips sign, its square does not), so enforcing a
+            # consistent sign convention is left entirely to loss_psi.
+            # Without this alignment an MSE against the "wrong" sign of
+            # psi_batch would report a large, misleading error (exactly 4x
+            # the mean squared amplitude of a unit-norm vector) for a
+            # psi_pred that is in fact the correct eigenstate.
+            with torch.no_grad():
+                sign = torch.sign(
+                    torch.sum(psi_pred[:n_labeled] * psi_batch, dim=1, keepdim=True)
+                )
+                sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+            loss_psi = torch.nn.functional.mse_loss(
+                psi_pred[:n_labeled], sign * psi_batch
+            )
+        else:
+            loss_e = torch.zeros((), device=mu_batch.device)
+            loss_psi = torch.zeros((), device=mu_batch.device)
+
+        total_loss = loss_e + loss_psi + physics_weight * (loss_fsm + loss_var)
+
+        return total_loss, {
+            "e": loss_e.item(),
+            "psi": loss_psi.item(),
+            "fsm": loss_fsm.item(),
+            "var": loss_var.item(),
+            "lam_mean": E_rayleigh.abs().mean().item(),
             "physics_wt": physics_weight,
         }
 

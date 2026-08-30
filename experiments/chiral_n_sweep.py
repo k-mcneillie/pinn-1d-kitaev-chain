@@ -14,7 +14,7 @@ Trains ``chiral`` (SirenPINNChiral + ChiralFSMLoss) and ``structural_nambu``
                                    the internal gauge of the degenerate
                                    subspace
 
-The prediction (``docs/markdown/under-determination-and-n-scaling.md``):
+The prediction (``docs/markdown/derivations/under-determination-and-n-scaling.md``):
 ``gauge_gap`` stays ~0 for ``chiral`` at every ``N`` (the smallest singular
 value of ``h`` is simple, ``O(t)`` gap, N-independent) and stays large / does
 not shrink for ``structural_nambu`` (the selecting signal is ``O(lambda_1^2)
