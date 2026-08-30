@@ -305,3 +305,167 @@ def reconstruct_bdg_eigenvector(
     particle = (u + sign * v) / 2.0
     hole = (u - sign * v) / 2.0
     return np.concatenate([particle, hole])
+
+
+def fill_skew(vec: torch.Tensor, n_sites: int) -> torch.Tensor:
+    """Map free parameters to real skew-symmetric matrices.
+
+    The strictly-upper-triangular entries of an ``N x N`` real
+    antisymmetric matrix are its ``N (N - 1) / 2`` independent degrees of
+    freedom. This scatters ``vec`` into that triangle (row-major, the order
+    of :func:`torch.triu_indices` with ``offset=1``) and antisymmetrises,
+    giving a batch of generators ``A`` with ``A = -A^T`` suitable for
+    :func:`torch.matrix_exp` (which sends a real skew matrix to ``SO(N)``).
+
+    The operation is differentiable in ``vec`` and runs on ``vec``'s
+    device and dtype.
+
+    Args:
+        vec: Free parameters, shape ``(..., n_sites * (n_sites - 1) // 2)``.
+        n_sites: Matrix dimension ``N``.
+
+    Returns:
+        A tensor of shape ``(..., n_sites, n_sites)`` with each
+        ``n_sites x n_sites`` slice real and antisymmetric.
+
+    Raises:
+        ValueError: If the last axis of ``vec`` is not
+            ``n_sites * (n_sites - 1) // 2``.
+    """
+    expected = n_sites * (n_sites - 1) // 2
+    if vec.shape[-1] != expected:
+        raise ValueError(
+            f"expected last dim {expected} for n_sites={n_sites}, got {vec.shape[-1]}"
+        )
+
+    lead = vec.shape[:-1]
+    flat = vec.reshape(-1, expected)
+    rows, cols = torch.triu_indices(n_sites, n_sites, offset=1, device=vec.device)
+
+    upper = flat.new_zeros(flat.shape[0], n_sites, n_sites)
+    upper[:, rows, cols] = flat
+    skew = upper - upper.transpose(-2, -1)
+    return skew.reshape(*lead, n_sites, n_sites)
+
+
+def chiral_block_det_sign(
+    mu_batch: torch.Tensor,
+    n_sites: int,
+    hopping: float = 1.0,
+    pairing: float = 0.5,
+) -> torch.Tensor:
+    """Sign of ``det h(mu)`` for a batch of ``mu``, without forming ``h``.
+
+    ``h(mu)`` is bidiagonal (see :func:`chiral_block`), so its determinant
+    obeys the continuant recurrence
+
+        D_0 = 1,  D_1 = -mu,
+        D_k = -mu * D_{k-1} - (t^2 - delta^2) * D_{k-2},
+
+    with ``det h(mu) = D_N``. Because the sub- and super-diagonals are
+    constant, the product ``h[k, k+1] * h[k+1, k] = t^2 - delta^2`` is the
+    same at every step. This is ``O(N)`` per ``mu`` and allocates nothing.
+
+    The determinant sign is the ingredient the full-SVD chiral model needs:
+    a frame ``U, V in SO(N)`` with ``Sigma >= 0`` can only represent
+    ``det h >= 0``, and ``det h(mu)`` oscillates in sign across the
+    topological phase (the recurrence is a Chebyshev polynomial of the
+    second kind). Feeding ``sign(det h(mu))`` into a last-column reflection
+    of ``V`` restores ``V in O(N)`` and makes every ``mu`` representable.
+
+    Args:
+        mu_batch: Chemical-potential values, shape ``(batch_size, 1)`` or
+            ``(batch_size,)``.
+        n_sites: Number of physical lattice sites, ``N``.
+        hopping: Nearest-neighbour hopping amplitude, ``t``.
+        pairing: P-wave pairing amplitude, ``delta``.
+
+    Returns:
+        A tensor of shape ``(batch_size,)`` with values in ``{-1.0, +1.0}``
+        (an exact zero determinant is mapped to ``+1.0``), on the device
+        and dtype of ``mu_batch``.
+    """
+    mu = mu_batch.reshape(-1)
+    gap = hopping * hopping - pairing * pairing
+
+    if n_sites < 1:  # pragma: no cover - a chain always has at least one site
+        raise ValueError(f"n_sites must be >= 1, got {n_sites}")
+
+    d_prev = torch.ones_like(mu)  # D_0
+    d_curr = -mu  # D_1
+    for _ in range(2, n_sites + 1):
+        d_prev, d_curr = d_curr, -mu * d_curr - gap * d_prev
+    det = d_curr
+
+    sign = torch.sign(det)
+    return torch.where(sign == 0, torch.ones_like(sign), sign)
+
+
+def reconstruct_bdg_eigenvectors(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    sign: int = 1,
+) -> torch.Tensor:
+    """Batched Torch counterpart of :func:`reconstruct_bdg_eigenvector`.
+
+    Applies the same map as the NumPy single-vector version, along the last
+    axis, so a whole frame is reconstructed at once by passing the
+    transposed singular-vector matrices ``U^T``, ``V^T`` (shape
+    ``(..., N, N)`` with row ``k`` the ``k``-th singular vector).
+
+    Args:
+        u: Left singular vectors, shape ``(..., N)``.
+        v: Right singular vectors, shape ``(..., N)``.
+        sign: ``+1`` for the ``+lambda`` eigenvector, ``-1`` for its
+            particle-hole (``-lambda``) partner.
+
+    Returns:
+        A tensor of shape ``(..., 2 * N)`` laid out as (particle block,
+        hole block), unit-norm along the last axis when ``u``, ``v`` are.
+    """
+    particle = (u + sign * v) / 2.0
+    hole = (u - sign * v) / 2.0
+    return torch.cat([particle, hole], dim=-1)
+
+
+def resolve_svd_sign(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tol: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fix the per-column ``(u_k, v_k) -> (-u_k, -v_k)`` gauge reproducibly.
+
+    A singular value decomposition is unique only up to a sign shared by
+    each matched left/right singular-vector pair (and, within a degenerate
+    block, an orthogonal rotation). Two training runs of the full-SVD
+    chiral model therefore settle on frames that differ by these signs even
+    when every physical observable agrees. This routine removes the sign
+    freedom deterministically: each column pair is flipped so that the
+    first component of ``u_k`` whose magnitude exceeds ``tol`` is positive.
+    Columns whose entries are all within ``tol`` of zero are left as they
+    are. The flip sign is detached from the graph, and the map is
+    idempotent, so it is safe to apply at evaluation time.
+
+    It does not touch the singular values and is not used inside the loss
+    (all ``sigma_k >= 0`` structurally); it is a post-hoc canonicalisation
+    for cross-seed frame comparisons.
+
+    Args:
+        u: Left singular vectors as columns, shape ``(..., N, K)``. A single
+            pair is ``K = 1`` via ``u.unsqueeze(-1)``.
+        v: Right singular vectors as columns, same shape as ``u``.
+        tol: Magnitude below which a ``u`` component is treated as zero when
+            picking the sign-defining entry.
+
+    Returns:
+        ``(u, v)`` with each column pair sign-canonicalised.
+    """
+    mask = (u.abs() > tol).to(torch.int8)
+    first = torch.argmax(mask, dim=-2, keepdim=True)  # first non-zero row per column
+    lead = torch.gather(u, -2, first).squeeze(-2)
+    sign = torch.sign(lead)
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign).detach()
+    scale = sign.unsqueeze(-2)
+    return u * scale, v * scale

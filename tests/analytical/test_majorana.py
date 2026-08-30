@@ -10,10 +10,14 @@ from kitaev.analytical import (
     KitaevChainHamiltonian,
     chiral_block,
     chiral_block_batched,
+    chiral_block_det_sign,
     chiral_block_matvec,
+    fill_skew,
     majorana_basis_change,
     reconstruct_bdg_eigenvector,
+    reconstruct_bdg_eigenvectors,
     resolve_singular_branch,
+    resolve_svd_sign,
 )
 
 T = 1.0
@@ -290,6 +294,198 @@ class TestResolveSingularBranch(TestCase):
 
         self.assertIsNotNone(u.grad)
         self.assertIsNotNone(v.grad)
+        self.assertFalse(torch.isnan(u.grad).any())
+        self.assertFalse(torch.isnan(v.grad).any())
+
+
+class TestFillSkew(TestCase):
+    """Mapping free parameters to real skew-symmetric generators."""
+
+    def test_shape_and_antisymmetry(self):
+        """Output is (B, N, N) and exactly antisymmetric."""
+        n_sites = 6
+        vec = torch.randn(4, n_sites * (n_sites - 1) // 2, dtype=torch.float64)
+        skew = fill_skew(vec, n_sites)
+
+        self.assertEqual(skew.shape, (4, n_sites, n_sites))
+        self.assertTrue(torch.allclose(skew, -skew.transpose(-2, -1), atol=0.0))
+        diag = torch.diagonal(skew, dim1=-2, dim2=-1)
+        self.assertTrue(torch.all(diag == 0.0))
+
+    def test_reproduces_the_upper_triangle(self):
+        """The N(N-1)/2 parameters land in the strict upper triangle in order."""
+        n_sites = 5
+        expected = n_sites * (n_sites - 1) // 2
+        vec = torch.arange(1, expected + 1, dtype=torch.float64).unsqueeze(0)
+        skew = fill_skew(vec, n_sites)[0]
+
+        rows, cols = torch.triu_indices(n_sites, n_sites, offset=1)
+        self.assertTrue(torch.equal(skew[rows, cols], vec[0]))
+        self.assertTrue(torch.equal(skew[cols, rows], -vec[0]))
+
+    def test_exp_of_generator_is_orthogonal(self):
+        """matrix_exp(fill_skew(...)) is in SO(N)."""
+        n_sites = 7
+        vec = torch.randn(3, n_sites * (n_sites - 1) // 2, dtype=torch.float64)
+        q = torch.matrix_exp(fill_skew(vec, n_sites))
+        eye = torch.eye(n_sites, dtype=torch.float64).expand_as(q)
+
+        self.assertTrue(torch.allclose(q.transpose(-2, -1) @ q, eye, atol=1e-10))
+        self.assertTrue(
+            torch.allclose(
+                torch.linalg.det(q), torch.ones(3, dtype=torch.float64), atol=1e-10
+            )
+        )
+
+    def test_leading_batch_dims_and_device_follow_input(self):
+        """Extra leading axes are preserved; dtype/device follow vec."""
+        n_sites = 4
+        vec = torch.randn(2, 3, n_sites * (n_sites - 1) // 2, dtype=torch.float32)
+        skew = fill_skew(vec, n_sites)
+        self.assertEqual(skew.shape, (2, 3, n_sites, n_sites))
+        self.assertEqual(skew.dtype, torch.float32)
+        self.assertEqual(skew.device, vec.device)
+
+    def test_differentiable_in_vec(self):
+        """Gradients flow back to vec without NaNs."""
+        n_sites = 5
+        vec = torch.randn(
+            2, n_sites * (n_sites - 1) // 2, dtype=torch.float64, requires_grad=True
+        )
+        fill_skew(vec, n_sites).pow(2).sum().backward()
+        self.assertIsNotNone(vec.grad)
+        self.assertFalse(torch.isnan(vec.grad).any())
+        self.assertGreater(vec.grad.abs().sum().item(), 0.0)
+
+    def test_wrong_width_raises(self):
+        vec = torch.zeros(1, 5)
+        with self.assertRaises(ValueError):
+            fill_skew(vec, 6)
+
+
+class TestChiralBlockDetSign(TestCase):
+    """Sign of det h(mu) from the O(N) continuant recurrence."""
+
+    def test_matches_numpy_determinant_across_the_domain(self):
+        """Agrees with sign(det(chiral_block)) at every mu, including det < 0."""
+        n_sites = 20
+        mu_grid = np.linspace(0.05, 4.0, 241)
+        mu = torch.tensor(mu_grid, dtype=torch.float64)
+        got = chiral_block_det_sign(mu, n_sites, T, DELTA).numpy()
+
+        want = np.array(
+            [
+                np.sign(np.linalg.det(chiral_block(m, n_sites, T, DELTA)))
+                for m in mu_grid
+            ]
+        )
+        self.assertTrue(np.array_equal(got, want))
+        # The topological phase genuinely contains both signs.
+        topological = mu_grid < 2.0
+        self.assertIn(-1.0, set(got[topological]))
+        self.assertIn(1.0, set(got[topological]))
+
+    def test_values_are_pm_one_and_shape_is_flat(self):
+        mu = torch.tensor([[0.3], [1.1], [2.4], [3.9]], dtype=torch.float64)
+        got = chiral_block_det_sign(mu, 12, T, DELTA)
+        self.assertEqual(got.shape, (4,))
+        self.assertTrue(set(got.tolist()).issubset({-1.0, 1.0}))
+
+    def test_even_in_mu_for_even_chain(self):
+        """det h is even in mu for N even, so the sign is too."""
+        n_sites = 20
+        mu = torch.linspace(0.1, 3.7, 30, dtype=torch.float64)
+        pos = chiral_block_det_sign(mu, n_sites, T, DELTA)
+        neg = chiral_block_det_sign(-mu, n_sites, T, DELTA)
+        self.assertTrue(torch.equal(pos, neg))
+
+
+class TestReconstructBdgEigenvectorsBatched(TestCase):
+    """Batched Torch reconstruction of BdG eigenvectors from a frame."""
+
+    def test_matches_numpy_single_vector_version(self):
+        n_sites = 8
+        h = chiral_block(1.3, n_sites, T, DELTA)
+        left, _singular, right_t = np.linalg.svd(h)
+        u = torch.tensor(left.T, dtype=torch.float64)  # row k = u_k
+        v = torch.tensor(right_t, dtype=torch.float64)
+
+        for sign in (1, -1):
+            got = reconstruct_bdg_eigenvectors(u, v, sign=sign).numpy()
+            want = np.stack(
+                [
+                    reconstruct_bdg_eigenvector(left[:, k], right_t[k, :], sign=sign)
+                    for k in range(n_sites)
+                ]
+            )
+            self.assertTrue(np.allclose(got, want, atol=1e-12))
+
+    def test_preserves_leading_axes_and_unit_norm(self):
+        n_sites = 6
+        u = torch.randn(3, 4, n_sites, dtype=torch.float64)
+        u = u / u.norm(dim=-1, keepdim=True)
+        # Make v share u's norm but be independent, then orthonormalise pairwise.
+        v = torch.randn(3, 4, n_sites, dtype=torch.float64)
+        v = v / v.norm(dim=-1, keepdim=True)
+        psi = reconstruct_bdg_eigenvectors(u, v, sign=1)
+        self.assertEqual(psi.shape, (3, 4, 2 * n_sites))
+        # ||psi||^2 = (||u||^2 + ||v||^2) / 2 = 1 when u, v are unit and the
+        # cross term u.v cancels between the particle and hole blocks.
+        expected = 0.5 * (u.pow(2).sum(-1) + v.pow(2).sum(-1))
+        self.assertTrue(torch.allclose(psi.pow(2).sum(-1), expected, atol=1e-12))
+
+
+class TestResolveSvdSign(TestCase):
+    """Reproducible per-column sign canonicalisation of an SVD frame."""
+
+    def _frame(self):
+        n_sites = 6
+        h = chiral_block(2.7, n_sites, T, DELTA)
+        left, _s, right_t = np.linalg.svd(h)
+        u = torch.tensor(left, dtype=torch.float64).unsqueeze(0)
+        v = torch.tensor(right_t.T, dtype=torch.float64).unsqueeze(0)
+        return u, v
+
+    def test_leading_entry_is_made_positive(self):
+        u, v = self._frame()
+        u_res, _v_res = resolve_svd_sign(u * -1.0, v * -1.0)
+        # First above-tol entry of every column is now positive.
+        lead = torch.where(
+            u_res.abs() > 1e-6, u_res, torch.full_like(u_res, float("nan"))
+        )
+        first = lead[0].transpose(0, 1)  # column-major
+        for col in first:
+            nonnan = col[~torch.isnan(col)]
+            self.assertGreater(nonnan[0].item(), 0.0)
+
+    def test_idempotent_and_deterministic(self):
+        u, v = self._frame()
+        once = resolve_svd_sign(u, v)
+        twice = resolve_svd_sign(*once)
+        self.assertTrue(torch.equal(once[0], twice[0]))
+        self.assertTrue(torch.equal(once[1], twice[1]))
+
+    def test_matched_pair_flips_together(self):
+        u, v = self._frame()
+        u_res, v_res = resolve_svd_sign(u, v)
+        # Column-wise, (u_res, v_res) is either (u, v) or (-u, -v).
+        ratio_u = (u_res / u)[0]
+        ratio_v = (v_res / v)[0]
+        self.assertTrue(torch.allclose(ratio_u, ratio_v, atol=1e-9))
+
+    def test_all_near_zero_column_is_left_alone(self):
+        u = torch.zeros(1, 4, 1, dtype=torch.float64)
+        v = torch.ones(1, 4, 1, dtype=torch.float64)
+        u_res, v_res = resolve_svd_sign(u, v, tol=1e-6)
+        self.assertTrue(torch.equal(u_res, u))
+        self.assertTrue(torch.equal(v_res, v))
+
+    def test_sign_is_detached(self):
+        u, v = self._frame()
+        u = u.clone().requires_grad_(True)
+        v = v.clone().requires_grad_(True)
+        u_res, v_res = resolve_svd_sign(u, v)
+        (u_res.sum() + v_res.sum()).backward()
         self.assertFalse(torch.isnan(u.grad).any())
         self.assertFalse(torch.isnan(v.grad).any())
 
