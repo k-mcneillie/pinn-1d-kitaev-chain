@@ -169,10 +169,10 @@ class BdGEvaluationProbe(TrainingCallback):
 
         was_training = model.training
         eval_model.eval()
-        device = next(model.parameters()).device
+        param = next(model.parameters())
         with torch.no_grad():
             mu_tensor = torch.tensor(
-                self.mu_grid[:, None], dtype=torch.float32, device=device
+                self.mu_grid[:, None], dtype=param.dtype, device=param.device
             )
             e_pred_t, psi_pred_t = eval_model(mu_tensor)
         if was_training:

@@ -214,6 +214,18 @@ def test_probe_scores_a_chiral_model_through_the_adapter() -> None:
     assert history["probe_psi_norm"][-1] == pytest.approx(1.0, abs=1e-5)
 
 
+def test_probe_evaluates_in_the_models_dtype() -> None:
+    """A float64 model gets a float64 grid, matching well below the fp32 floor."""
+    probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1, adapt=_chiral_adapter)
+    model = _ExactChiralModel(N_SITES, HOPPING, PAIRING).double()
+    history = TrainingHistory()
+
+    probe.on_epoch_end(1, model, history)
+
+    assert history["probe_e_mae"][-1] == pytest.approx(0.0, abs=1e-10)
+    assert history["probe_subspace_infidelity"][-1] == pytest.approx(0.0, abs=1e-10)
+
+
 def test_probe_scores_a_direct_e_psi_model_without_an_adapter() -> None:
     probe = _probe(mu_grid=np.linspace(2.3, 3.8, 15), every=1)  # adapt=None
     model = _ExactEPsiModel(N_SITES, HOPPING, PAIRING)
