@@ -23,6 +23,10 @@ dispersion.
     python experiments/chiral_svd_spectrum.py
     python experiments/chiral_svd_spectrum.py --seeds 0 1 2 --epochs 3000
     python experiments/chiral_svd_spectrum.py --seeds 0 --gauge-weight 1e-3
+    python experiments/chiral_svd_spectrum.py --seeds 0 --reweight-eps 1e-2
+    python experiments/chiral_svd_spectrum.py --seeds 0 --curriculum-triples 2
+    python experiments/chiral_svd_spectrum.py --sigma-source rayleigh --seeds 0
+    python experiments/chiral_svd_spectrum.py --sigma-source rayleigh --float64
     python experiments/chiral_svd_spectrum.py --smoke
     python experiments/chiral_svd_spectrum.py --figures-only results/logs/<session>
 """
@@ -45,7 +49,6 @@ from sesh import Session
 from kitaev.analytical import (
     KitaevChainHamiltonian,
     chiral_block,
-    reconstruct_bdg_eigenvectors,
     resolve_svd_sign,
 )
 from kitaev.data.sampling_region import SamplingRegion
@@ -81,7 +84,9 @@ STEPS_PER_EPOCH = 8
 MAJORANA_MUS = (0.3, 0.9, 1.5, 1.9)
 
 
-def build_chiral_svd_model(n_sites: int = N_SITES) -> SirenPINNChiralFull:
+def build_chiral_svd_model(
+    n_sites: int = N_SITES, *, sigma_source: str = "head"
+) -> SirenPINNChiralFull:
     """The single-place model factory, reused by training and reload."""
     return SirenPINNChiralFull(
         n_sites=n_sites,
@@ -90,6 +95,7 @@ def build_chiral_svd_model(n_sites: int = N_SITES) -> SirenPINNChiralFull:
         input_scale=4.0,
         hopping=T,
         pairing=DELTA,
+        sigma_source=sigma_source,
     )
 
 
@@ -126,7 +132,7 @@ def _reflection_residual(adapter: torch.nn.Module, device: str) -> float:
     adapter.eval()
     half = np.linspace(0.0, 4.0, 200)[:, None]
     with torch.no_grad():
-        pos = torch.tensor(half, dtype=torch.float32, device=device)
+        pos = torch.tensor(half, dtype=torch.get_default_dtype(), device=device)
         e_pos = np.abs(adapter(pos)[0].detach().cpu().numpy().ravel())
         e_neg = np.abs(adapter(-pos)[0].detach().cpu().numpy().ravel())
     return float(np.abs(e_pos - e_neg).max())
@@ -148,7 +154,7 @@ def _lowest_pair_metrics(history: Any, adapter: torch.nn.Module, device: str) ->
 
 def _spectrum_metrics(history: Any, adapter: ChiralFullToBdGAdapter) -> dict:
     """Whole-spectrum columns, from the SpectrumEvaluationProbe history."""
-    x = torch.tensor(MU_GRID[:, None], dtype=torch.float32)
+    x = torch.tensor(MU_GRID[:, None], dtype=torch.get_default_dtype())
     with torch.no_grad():
         det_pred = adapter.det_sign(x).cpu().numpy()
     det_exact = np.array(
@@ -163,18 +169,55 @@ def _spectrum_metrics(history: Any, adapter: ChiralFullToBdGAdapter) -> dict:
     }
 
 
+def _physical_criteria(adapter: ChiralFullToBdGAdapter) -> dict:
+    """Gauge-robust pass criteria for the near-zero sector (A3).
+
+    Below the finite-size splitting the *value* of ``sigma_min`` is not
+    physical -- what matters is that the near-zero subspace is right, that
+    ``sigma_1 << sigma_2``, and that each individual Majorana localises on
+    one end. Reported alongside (not instead of) the raw spectrum MAE.
+    """
+    ham = KitaevChainHamiltonian(n_sites=N_SITES, hopping=T, pairing=DELTA)
+    mus = MU_GRID[np.abs(MU_GRID) < TRANSITION]
+    x = torch.tensor(mus[:, None], dtype=torch.get_default_dtype())
+    with torch.no_grad():
+        _e, psi = adapter(x)
+        u_mat, sigma, v_mat = adapter.model(x)
+    psi = psi.cpu().numpy()
+    psi = psi / np.clip(np.linalg.norm(psi, axis=1), 1e-12, None)[:, None]
+    sigma = sigma.cpu().numpy()
+    half = N_SITES // 2
+
+    infids, ratios, locs = [], [], []
+    for i, mu in enumerate(mus):
+        w, vecs = np.linalg.eigh(ham.build(float(mu)))
+        near = vecs[:, np.argsort(np.abs(w))[:2]]
+        infids.append(1.0 - float(np.linalg.norm(near.T @ psi[i])))
+        ordered = np.sort(sigma[i])
+        ratios.append(ordered[0] / max(ordered[1], 1e-30))
+        k = int(sigma[i].argmin())
+        u_sq = (u_mat[i, :, k].cpu().numpy()) ** 2
+        v_sq = (v_mat[i, :, k].cpu().numpy()) ** 2
+        locs.append(
+            0.5 * max(u_sq[:half].sum(), u_sq[half:].sum())
+            + 0.5 * max(v_sq[:half].sum(), v_sq[half:].sum())
+        )
+    return {
+        "infidelity_topological": float(np.mean(infids)),
+        "sigma_gap_ratio": float(np.median(ratios)),
+        "majorana_localisation": float(np.mean(locs)),
+    }
+
+
 def _plot_full_spectrum(adapter: ChiralFullToBdGAdapter, out_path: Path) -> None:
     """Predicted +-sigma_k(mu) over exact diagonalisation, with a residual panel."""
     ham = KitaevChainHamiltonian(n_sites=N_SITES, hopping=T, pairing=DELTA)
     exact = np.array(
         [np.sort(np.linalg.eigvalsh(ham.build(float(mu)))) for mu in MU_GRID]
     )
+    grid = torch.tensor(MU_GRID[:, None], dtype=torch.get_default_dtype())
     with torch.no_grad():
-        pred = (
-            adapter.full_spectrum(torch.tensor(MU_GRID[:, None], dtype=torch.float32))
-            .cpu()
-            .numpy()
-        )
+        pred = adapter.full_spectrum(grid).cpu().numpy()
 
     use_house_style()
     fig, (ax_top, ax_bot) = plt.subplots(
@@ -200,9 +243,33 @@ def _plot_full_spectrum(adapter: ChiralFullToBdGAdapter, out_path: Path) -> None
     plt.close(fig)
 
 
+def _majorana_pair(
+    u_col: np.ndarray, v_col: np.ndarray, exact_a: np.ndarray, exact_b: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Order a predicted (|u_1|^2, |v_1|^2) pair against the exact pair.
+
+    Matches the predicted densities to the exact ones by overlap, then
+    orients both so the first entry is the left-localised end mode.
+    """
+    pred_a, pred_b = u_col, v_col
+    if pred_a @ exact_a + pred_b @ exact_b < pred_a @ exact_b + pred_b @ exact_a:
+        pred_a, pred_b = pred_b, pred_a
+    half = exact_a.shape[0] // 2
+    if exact_a[:half].sum() < exact_a[half:].sum():
+        pred_a, pred_b, exact_a, exact_b = pred_b, pred_a, exact_b, exact_a
+    return pred_a, pred_b, exact_a, exact_b
+
+
 def _plot_majorana_densities(adapter: ChiralFullToBdGAdapter, out_path: Path) -> None:
-    """Reconstructed left/right end-mode site densities across the topological phase."""
-    ham = KitaevChainHamiltonian(n_sites=N_SITES, hopping=T, pairing=DELTA)
+    """Individual end-mode densities |u_1(n)|^2 and |v_1(n)|^2 across the phase.
+
+    In the chiral SVD the near-zero pair is the *single* smallest triple
+    ``(u_1, v_1)`` (the second singular value is ``O(t)``), and its left and
+    right singular vectors are the two end-localised Majorana modes:
+    ``psi_left`` has density ``|u_1(n)|^2`` and ``psi_right`` density
+    ``|v_1(n)|^2``. Compared against the smallest singular vectors of the
+    exact chiral block.
+    """
     sites = np.arange(N_SITES)
     model = adapter.model
 
@@ -211,35 +278,27 @@ def _plot_majorana_densities(adapter: ChiralFullToBdGAdapter, out_path: Path) ->
         1, len(MAJORANA_MUS), figsize=(3.2 * len(MAJORANA_MUS), 3.0), sharey=True
     )
     for ax, mu in zip(axes, MAJORANA_MUS, strict=True):
-        x = torch.tensor([[mu]], dtype=torch.float32)
+        x = torch.tensor([[mu]], dtype=torch.get_default_dtype())
         with torch.no_grad():
             u_mat, sigma, v_mat = model(x)
-        order = torch.argsort(sigma[0])[:2]
-        u_pair = u_mat[0, :, order].T  # (2, N)
-        v_pair = v_mat[0, :, order].T
-        u_pair, v_pair = resolve_svd_sign(u_pair.unsqueeze(-1), v_pair.unsqueeze(-1))
-        psi = reconstruct_bdg_eigenvectors(
-            u_pair.squeeze(-1), v_pair.squeeze(-1)
-        ).numpy()
-        left = (psi[0] + psi[1]) / np.sqrt(2.0)
-        right = (psi[0] - psi[1]) / np.sqrt(2.0)
-        dens_left = left[:N_SITES] ** 2 + left[N_SITES:] ** 2
-        dens_right = right[:N_SITES] ** 2 + right[N_SITES:] ** 2
+        k = int(torch.argmin(sigma[0]))
+        pred_u = (u_mat[0, :, k] ** 2).numpy()
+        pred_v = (v_mat[0, :, k] ** 2).numpy()
 
-        w, vecs = np.linalg.eigh(ham.build(float(mu)))
-        near = vecs[:, np.argsort(np.abs(w))[:2]]
-        gl = (near[:, 0] + near[:, 1]) / np.sqrt(2.0)
-        gr = (near[:, 0] - near[:, 1]) / np.sqrt(2.0)
-        ex_left = gl[:N_SITES] ** 2 + gl[N_SITES:] ** 2
-        ex_right = gr[:N_SITES] ** 2 + gr[N_SITES:] ** 2
+        block = chiral_block(mu, N_SITES, T, DELTA)
+        u_ex, s_ex, vt_ex = np.linalg.svd(block)
+        j = int(np.argmin(s_ex))
+        pred_l, pred_r, exact_l, exact_r = _majorana_pair(
+            pred_u, pred_v, u_ex[:, j] ** 2, vt_ex[j, :] ** 2
+        )
 
-        ax.fill_between(sites, ex_left, color="#2a9d8f", alpha=0.25, lw=0)
-        ax.fill_between(sites, ex_right, color="#e9c46a", alpha=0.25, lw=0)
-        ax.plot(sites, dens_left, color="#2a9d8f", lw=1.4, label="left mode")
-        ax.plot(sites, dens_right, color="#e9c46a", lw=1.4, label="right mode")
+        ax.fill_between(sites, exact_l, color="#2a9d8f", alpha=0.25, lw=0)
+        ax.fill_between(sites, exact_r, color="#e9c46a", alpha=0.25, lw=0)
+        ax.plot(sites, pred_l, color="#2a9d8f", lw=1.4, label="left end mode")
+        ax.plot(sites, pred_r, color="#e9c46a", lw=1.4, label="right end mode")
         ax.set_title(rf"$\mu = {mu:.2f}\,t$")
         ax.set_xlabel("site $n$")
-    axes[0].set_ylabel("site density (predicted lines, exact shaded)")
+    axes[0].set_ylabel("end-mode site density (predicted lines, exact shaded)")
     axes[0].legend(frameon=False, fontsize=8)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -248,7 +307,7 @@ def _plot_majorana_densities(adapter: ChiralFullToBdGAdapter, out_path: Path) ->
 
 def _plot_det_sign(adapter: ChiralFullToBdGAdapter, out_path: Path) -> None:
     """sign(det h) from the frame vs analytic, plus sigma_min(mu) on a log axis."""
-    x = torch.tensor(MU_GRID[:, None], dtype=torch.float32)
+    x = torch.tensor(MU_GRID[:, None], dtype=torch.get_default_dtype())
     with torch.no_grad():
         det_pred = adapter.det_sign(x).cpu().numpy()
         _u, sigma, _v = adapter.model(x)
@@ -292,7 +351,7 @@ def _frame_dispersions(models: list[torch.nn.Module]) -> tuple[float, float]:
     ``frame`` = after resolve_svd_sign and sigma-nearest column matching,
     mean over mu of ``||U_a - U_b||_F`` across seed pairs -- gauge-dependent.
     """
-    x = torch.tensor(MU_GRID[:, None], dtype=torch.float32)
+    x = torch.tensor(MU_GRID[:, None], dtype=torch.get_default_dtype())
     densities, us = [], []
     for model in models:
         with torch.no_grad():
@@ -338,9 +397,24 @@ def _plot_frame_reproducibility(
 
 
 def train_one(
-    seed: int, epochs: int, gauge_weight: float, smoke: bool, session: Session
+    seed: int,
+    epochs: int,
+    gauge_weight: float,
+    smoke: bool,
+    session: Session,
+    *,
+    sigma_source: str = "head",
+    float64: bool = False,
+    lbfgs_epochs: int = 300,
+    reweight_eps: float | None = None,
+    curriculum_triples: int = 0,
+    curriculum_hold: int = 500,
+    curriculum_ramp: int = 1000,
 ) -> dict[str, Any]:
     """Train one seed of the full-SVD chiral model; return a metric row."""
+    if float64:
+        torch.set_default_dtype(torch.float64)
+        session.info("training in float64")
     torch.manual_seed(seed)
     np.random.seed(seed)
     # torch.matrix_exp has no MPS kernel, so fall back to CPU on Apple
@@ -354,16 +428,26 @@ def train_one(
         x.to(device) for x in _build_kitaev_operators(N_SITES, hopping=T, pairing=DELTA)
     )
 
-    model = build_chiral_svd_model()
+    model = build_chiral_svd_model(sigma_source=sigma_source)
+    # Under --smoke the 40-epoch budget cannot exercise the default
+    # hold/ramp, so shrink the curriculum schedule to fit.
+    hold, ramp = (5, 10) if smoke else (curriculum_hold, curriculum_ramp)
     loss_fn = ChiralSVDLoss(
-        n_sites=N_SITES, hopping=T, pairing=DELTA, gauge_weight=gauge_weight
+        n_sites=N_SITES,
+        hopping=T,
+        pairing=DELTA,
+        gauge_weight=gauge_weight,
+        reweight_eps=reweight_eps,
+        curriculum_triples=curriculum_triples,
+        curriculum_hold=hold,
+        curriculum_ramp=ramp,
     )
     train_loader, val_loader, lbfgs_loader = _loaders()
     two_phase = TwoPhaseConfig(
         adam_epochs=epochs,
         adam_lr=8e-4,
         adam_weight_decay=1e-6,
-        lbfgs_epochs=5 if smoke else 300,
+        lbfgs_epochs=5 if smoke else lbfgs_epochs,
         lbfgs_max_iter=25,
         lbfgs_history_size=20,
         lbfgs_line_search_fn="strong_wolfe",
@@ -439,23 +523,35 @@ def train_one(
         "model": "chiral_svd",
         "seed": seed,
         "adam_epochs": epochs,
+        "sigma_source": sigma_source,
+        "float64": float64,
         "gauge_weight": gauge_weight,
+        "reweight_eps": reweight_eps if reweight_eps is not None else 0.0,
+        "curriculum_triples": curriculum_triples,
     }
     row.update(_lowest_pair_metrics(history, adapter, str(device)))
     row.update(_spectrum_metrics(history, adapter))
+    row.update(_physical_criteria(adapter))
     row["wall_seconds"] = round(wall, 1)
     session.info(
         f"[chiral_svd seed={seed}] E MAE full {row['e_mae_full']:.3e} | "
         f"spectrum MAE {row['spectrum_mae']:.3e} "
         f"(bulk {row['spectrum_mae_bulk']:.3e}) | "
+        f"topo infidelity {row['infidelity_topological']:.3e} | "
+        f"sigma_1/sigma_2 {row['sigma_gap_ratio']:.2e} | "
+        f"Majorana loc {row['majorana_localisation']:.3f} | "
         f"det-sign agree {row['det_sign_agreement']:.3f}"
     )
     return row
 
 
 def _rebuild_adapter(checkpoint: Path) -> ChiralFullToBdGAdapter:
-    model = build_chiral_svd_model()
-    model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True))
+    """Reload a checkpoint, inferring ``sigma_source`` and dtype from it."""
+    state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    sigma_source = "head" if "head_s.weight" in state else "rayleigh"
+    torch.set_default_dtype(next(iter(state.values())).dtype)
+    model = build_chiral_svd_model(sigma_source=sigma_source)
+    model.load_state_dict(state)
     model.eval()
     return ChiralFullToBdGAdapter(model, hopping=T, pairing=DELTA)
 
@@ -493,17 +589,26 @@ def render_figures_only(session_dir: Path) -> list[Path]:
 
 
 def summarise(rows: list[dict[str, Any]]) -> str:
-    """Median over seeds of the headline columns."""
+    """Median over seeds of the headline columns.
+
+    The physical near-zero criteria (topological subspace infidelity,
+    ``sigma_1 / sigma_2``, Majorana localisation) lead; the raw spectrum
+    MAE and its near-zero split follow as reference, since below the
+    finite-size splitting the latter measures precision, not physics.
+    """
     keys = (
-        "e_mae_full",
-        "subspace_infidelity_max",
-        "spectrum_mae",
-        "spectrum_mae_bulk",
+        "infidelity_topological",
+        "sigma_gap_ratio",
+        "majorana_localisation",
         "det_sign_agreement",
+        "spectrum_mae_bulk",
+        "spectrum_mae",
+        "spectrum_mae_nearzero",
+        "e_mae_full",
     )
-    head = "  ".join(f"{k:>24}" for k in keys)
+    head = "  ".join(f"{k:>22}" for k in keys)
     cells = [f"{statistics.median(r[k] for r in rows):.3e}" for k in keys]
-    return head + "\n" + "  ".join(f"{c:>24}" for c in cells)
+    return head + "\n" + "  ".join(f"{c:>22}" for c in cells)
 
 
 def main() -> list[dict[str, Any]]:
@@ -517,7 +622,40 @@ def main() -> list[dict[str, Any]]:
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--epochs", type=int, default=3000)
+    parser.add_argument(
+        "--sigma-source",
+        choices=("head", "rayleigh"),
+        default="head",
+        help="softplus head (default) or the Rayleigh readout |u_k^T h v_k|",
+    )
+    parser.add_argument(
+        "--float64",
+        action="store_true",
+        help="train in double precision (CPU only; raises the sigma_min floor)",
+    )
+    parser.add_argument(
+        "--lbfgs-epochs",
+        type=int,
+        default=300,
+        help="L-BFGS refinement epochs after AdamW (0 to skip; for fast pilots)",
+    )
     parser.add_argument("--gauge-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--reweight-eps",
+        type=float,
+        default=None,
+        metavar="EPS",
+        help="per-column 1/max(sigma_k, EPS)^2 residual reweighting (default: off)",
+    )
+    parser.add_argument(
+        "--curriculum-triples",
+        type=int,
+        default=0,
+        metavar="K",
+        help="down-weight the K smallest triples early in training (default: 0, off)",
+    )
+    parser.add_argument("--curriculum-hold", type=int, default=500)
+    parser.add_argument("--curriculum-ramp", type=int, default=1000)
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -550,12 +688,31 @@ def main() -> list[dict[str, Any]]:
             "seeds": seeds,
             "epochs": epochs,
             "gauge_weight": args.gauge_weight,
+            "sigma_source": args.sigma_source,
+            "float64": args.float64,
+            "reweight_eps": args.reweight_eps,
+            "curriculum_triples": args.curriculum_triples,
         }
     )
 
     rows: list[dict[str, Any]] = []
     for seed in seeds:
-        rows.append(train_one(seed, epochs, args.gauge_weight, args.smoke, session))
+        rows.append(
+            train_one(
+                seed,
+                epochs,
+                args.gauge_weight,
+                args.smoke,
+                session,
+                sigma_source=args.sigma_source,
+                float64=args.float64,
+                lbfgs_epochs=args.lbfgs_epochs,
+                reweight_eps=args.reweight_eps,
+                curriculum_triples=args.curriculum_triples,
+                curriculum_hold=args.curriculum_hold,
+                curriculum_ramp=args.curriculum_ramp,
+            )
+        )
 
     out = args.out or (session.path() / "chiral_svd_spectrum.csv")
     with open(out, "w", newline="") as fh:
