@@ -1652,9 +1652,7 @@ def render_comparison_figures(
         stem = fan.model_label.lower().replace(" ", "_").replace("/", "_")
         maps_key = f"seed_density_maps_{stem}"
         paths[maps_key] = out_dir / f"{maps_key}.png"
-        plot_seed_density_dispersion_maps(
-            fan, hopping=T, save_path=paths[maps_key]
-        )
+        plot_seed_density_dispersion_maps(fan, hopping=T, save_path=paths[maps_key])
         slices_key = f"seed_density_slices_{stem}"
         paths[slices_key] = out_dir / f"{slices_key}.png"
         plot_seed_density_slices(fan, hopping=T, save_path=paths[slices_key])

@@ -75,9 +75,7 @@ class _DegeneratePair(torch.nn.Module):
 
 def test_sweep_seed_densities_shapes_and_normalisation(hamiltonian) -> None:
     mu = np.linspace(-4.0, 4.0, 25)
-    sweep = sweep_seed_densities(
-        _seed_models(3), hamiltonian, mu, model_label="siren"
-    )
+    sweep = sweep_seed_densities(_seed_models(3), hamiltonian, mu, model_label="siren")
 
     assert isinstance(sweep, SeedDensitySweep)
     assert sweep.n_seeds == 3
@@ -103,9 +101,7 @@ def test_sweep_seed_densities_requires_a_seed(hamiltonian) -> None:
 
 def test_identical_seeds_have_zero_spread(hamiltonian) -> None:
     torch.manual_seed(0)
-    model = SirenPINNDualHead(
-        n_sites=2 * N_SITES, hidden_features=8, hidden_layers=1
-    )
+    model = SirenPINNDualHead(n_sites=2 * N_SITES, hidden_features=8, hidden_layers=1)
     sweep = sweep_seed_densities(
         [model, model, model], hamiltonian, np.linspace(-4, 4, 9)
     )
@@ -143,22 +139,16 @@ def test_publication_figures_render(hamiltonian) -> None:
         sweep_seed_densities(_seed_models(2), hamiltonian, mu, model_label="model b"),
     ]
 
-    assert isinstance(
-        plot_seed_density_dispersion_maps(fans[0], hopping=1.0), Figure
-    )
+    assert isinstance(plot_seed_density_dispersion_maps(fans[0], hopping=1.0), Figure)
     assert isinstance(plot_seed_density_slices(fans[0], hopping=1.0), Figure)
-    assert isinstance(
-        plot_seed_edge_weight_envelope(fans, hopping=1.0), Figure
-    )
+    assert isinstance(plot_seed_edge_weight_envelope(fans, hopping=1.0), Figure)
 
 
 def test_density_slices_honours_requested_mu_positions(hamiltonian) -> None:
     mu = np.linspace(-4.0, 4.0, 41)
     sweep = sweep_seed_densities(_seed_models(2), hamiltonian, mu, model_label="m")
 
-    fig = plot_seed_density_slices(
-        sweep, hopping=1.0, mu_values_in_t=(0.0, 1.0, 3.0)
-    )
+    fig = plot_seed_density_slices(sweep, hopping=1.0, mu_values_in_t=(0.0, 1.0, 3.0))
 
     # 3 rows (particle, hole, pair) x 3 requested slices
     assert len(fig.axes) >= 9

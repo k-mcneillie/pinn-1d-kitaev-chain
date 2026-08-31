@@ -983,12 +983,17 @@ def plot_seed_density_slices(
         topological[:, None], sweep.pair_hole_exact, sweep.raw_hole_exact
     )
     rows = (
-        (r"particle $|\psi^p_n|^2$" + "\n(raw, per seed)", sweep.raw_particle,
-         particle_ref),
+        (
+            r"particle $|\psi^p_n|^2$" + "\n(raw, per seed)",
+            sweep.raw_particle,
+            particle_ref,
+        ),
         (r"hole $|\psi^h_n|^2$" + "\n(raw, per seed)", sweep.raw_hole, hole_ref),
-        (r"pair density $\rho_n/2$" + "\n(gauge-invariant, per seed)",
-         sweep.pair_particle + sweep.pair_hole,
-         sweep.pair_particle_exact + sweep.pair_hole_exact),
+        (
+            r"pair density $\rho_n/2$" + "\n(gauge-invariant, per seed)",
+            sweep.pair_particle + sweep.pair_hole,
+            sweep.pair_particle_exact + sweep.pair_hole_exact,
+        ),
     )
 
     fig, axes = plt.subplots(
@@ -1002,13 +1007,15 @@ def plot_seed_density_slices(
     )
     for c, i in enumerate(idxs):
         phase = "topological" if topological[i] else "trivial"
-        axes[0, c].set_title(
-            f"$\\mu = {mu[i]:+.2f}\\,t$\n({phase})", fontsize=10
-        )
+        axes[0, c].set_title(f"$\\mu = {mu[i]:+.2f}\\,t$\n({phase})", fontsize=10)
         for r, (_, per_seed, exact) in enumerate(rows):
             ax = axes[r, c]
             ax.fill_between(
-                sites, exact[i], color=INK, alpha=0.14, lw=0,
+                sites,
+                exact[i],
+                color=INK,
+                alpha=0.14,
+                lw=0,
                 label="exact" if (r, c) == (0, 0) else None,
             )
             for s in range(sweep.n_seeds):
@@ -1026,8 +1033,13 @@ def plot_seed_density_slices(
         axes[-1, c].set_xlabel("site $n$")
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(
-        handles, labels, loc="lower center", ncol=min(6, sweep.n_seeds + 1),
-        fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.04),
+        handles,
+        labels,
+        loc="lower center",
+        ncol=min(6, sweep.n_seeds + 1),
+        fontsize=8,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.04),
     )
     fig.suptitle(
         f"Per-seed site density at fixed $\\mu$ — {sweep.model_label} "
@@ -1098,14 +1110,18 @@ def plot_seed_edge_weight_envelope(
         ):
             ew = sweep.edge_weight(which, n_edge_sites=n_edge_sites, end="left")
             ax.fill_between(
-                mu, ew.min(axis=0), ew.max(axis=0), color=colour, alpha=0.25,
-                lw=0, label=f"{name} (seed range)",
+                mu,
+                ew.min(axis=0),
+                ew.max(axis=0),
+                color=colour,
+                alpha=0.25,
+                lw=0,
+                label=f"{name} (seed range)",
             )
             ax.plot(mu, np.median(ew, axis=0), color=colour, lw=1.4)
-        exact_ew = (
-            sweep.pair_particle_exact[:, left].sum(axis=1)
-            + sweep.pair_hole_exact[:, left].sum(axis=1)
-        )
+        exact_ew = sweep.pair_particle_exact[:, left].sum(
+            axis=1
+        ) + sweep.pair_hole_exact[:, left].sum(axis=1)
         ax.plot(mu, exact_ew, color=INK, ls=(0, (4, 3)), lw=1.3, label="exact")
         mark_transition(
             ax, hopping=hopping, mu_max=mu_max, two_sided=bool(mu.min() < 0)
@@ -1117,8 +1133,13 @@ def plot_seed_edge_weight_envelope(
         ax.set_visible(False)
     handles, labels = flat[0].get_legend_handles_labels()
     fig.legend(
-        handles, labels, loc="lower center", ncol=3, fontsize=9,
-        frameon=False, bbox_to_anchor=(0.5, -0.04),
+        handles,
+        labels,
+        loc="lower center",
+        ncol=3,
+        fontsize=9,
+        frameon=False,
+        bbox_to_anchor=(0.5, -0.04),
     )
     fig.suptitle(
         "Cross-seed spread of the left-end weight — "
