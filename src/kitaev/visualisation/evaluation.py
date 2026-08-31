@@ -305,6 +305,12 @@ class SeedDensitySweep:
         return p[:, :, cols].sum(axis=2) + h[:, :, cols].sum(axis=2)
 
 
+def _model_dtype(model: torch.nn.Module) -> torch.dtype:
+    """The model's parameter dtype, or the default if it is parameter-free."""
+    param = next(model.parameters(), None)
+    return param.dtype if param is not None else torch.get_default_dtype()
+
+
 def _edge_sites(n_sites: int, n_edge_sites: int) -> npt.NDArray[np.int64]:
     """Site indices counted as "edge" at both ends of the chain."""
     return np.concatenate(
@@ -359,7 +365,9 @@ def sweep_energy_and_edge_weight(
 
     model.eval()
     with torch.no_grad():
-        mu_tensor = torch.tensor(mu_sweep[:, None], dtype=torch.float32, device=device)
+        mu_tensor = torch.tensor(
+            mu_sweep[:, None], dtype=_model_dtype(model), device=device
+        )
         energy_pred_t, psi_pred_t = model(mu_tensor)
         energy_pred = energy_pred_t.cpu().numpy().flatten()
         prob_pred = (psi_pred_t**2).cpu().numpy()
@@ -463,7 +471,9 @@ def sweep_wavefunctions(
     model.eval()
     with torch.no_grad():
         mu_tensor = torch.tensor(
-            [[mu] for mu in probe_mus], dtype=torch.float32, device=device
+            [[mu] for mu in probe_mus],
+            dtype=_model_dtype(model),
+            device=device,
         )
         psi_pred = model(mu_tensor)[1].detach().cpu().numpy()
 
@@ -558,7 +568,9 @@ def sweep_seed_densities(
     raw_hole = np.zeros((n_seeds, n_mu, n_sites))
     pair_particle = np.zeros((n_seeds, n_mu, n_sites))
     pair_hole = np.zeros((n_seeds, n_mu, n_sites))
-    mu_tensor = torch.tensor(mu_grid[:, None], dtype=torch.float32, device=device)
+    mu_tensor = torch.tensor(
+        mu_grid[:, None], dtype=_model_dtype(models[0]), device=device
+    )
     for s, model in enumerate(models):
         model.eval()
         with torch.no_grad():
@@ -640,7 +652,9 @@ def sweep_spectrum(
 
     model.eval()
     with torch.no_grad():
-        mu_tensor = torch.tensor(mu_grid[:, None], dtype=torch.float32, device=device)
+        mu_tensor = torch.tensor(
+            mu_grid[:, None], dtype=_model_dtype(model), device=device
+        )
         e_pred_t, psi_pred_t = model(mu_tensor)
     energy_pred_signed = e_pred_t.detach().cpu().numpy().reshape(-1)
     psi_pred = psi_pred_t.detach().cpu().numpy()
@@ -731,7 +745,9 @@ def sweep_wavefunction_grid(
     model.eval()
     with torch.no_grad():
         mu_tensor = torch.tensor(
-            [[mu] for mu in probe_mus], dtype=torch.float32, device=device
+            [[mu] for mu in probe_mus],
+            dtype=_model_dtype(model),
+            device=device,
         )
         psi_pred_all = model(mu_tensor)[1].detach().cpu().numpy()
 
@@ -898,7 +914,7 @@ def sweep_mu_reflection(
     mu_half = np.linspace(0.0, mu_max, n_points)
     model.eval()
     with torch.no_grad():
-        pos = torch.tensor(mu_half[:, None], dtype=torch.float32, device=device)
+        pos = torch.tensor(mu_half[:, None], dtype=_model_dtype(model), device=device)
         energy_pos = np.abs(model(pos)[0].detach().cpu().numpy().reshape(-1))
         energy_neg = np.abs(model(-pos)[0].detach().cpu().numpy().reshape(-1))
     return MuReflectionSweep(

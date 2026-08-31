@@ -173,10 +173,10 @@ class BdGEvaluationProbe(TrainingCallback):
 
         was_training = model.training
         eval_model.eval()
-        device = next(model.parameters()).device
+        param = next(model.parameters())
         with torch.no_grad():
             mu_tensor = torch.tensor(
-                self.mu_grid[:, None], dtype=torch.float32, device=device
+                self.mu_grid[:, None], dtype=param.dtype, device=param.device
             )
             e_pred_t, psi_pred_t = eval_model(mu_tensor)
         if was_training:
@@ -343,10 +343,10 @@ class SpectrumEvaluationProbe(TrainingCallback):
         """Run one forward sweep and append the ``probe_spectrum_*`` metrics."""
         was_training = model.training
         model.eval()
-        device = next(model.parameters()).device
+        param = next(model.parameters())
         with torch.no_grad():
             mu_tensor = torch.tensor(
-                self.mu_grid[:, None], dtype=torch.float32, device=device
+                self.mu_grid[:, None], dtype=param.dtype, device=param.device
             )
             spectrum_pred_t = self.spectrum(model, mu_tensor)
         if was_training:
