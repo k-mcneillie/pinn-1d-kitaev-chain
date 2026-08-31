@@ -15,11 +15,22 @@ wavefunctions, or the rest of the spectrum.
 
 with ``U`` in ``SO(N)`` and ``V`` in ``O(N)`` by construction (matrix
 exponentials of skew generators, plus a determinant-fixing last-column
-reflection on ``V``) and ``Sigma >= 0`` by construction (``softplus``). Paired
-with :class:`kitaev.training.loss.ChiralSVDLoss` -- a single Frobenius
-residual with no folded-spectrum floor -- it yields the whole ``2N`` BdG
-spectrum in one pass, the individual Majoranas as smooth signed curves, and
-the ``Z2`` datum ``sign(det h(mu))`` from the frame.
+reflection on ``V``) and ``Sigma >= 0`` by construction. Paired with
+:class:`kitaev.training.loss.ChiralSVDLoss` -- a single Frobenius residual
+with no folded-spectrum floor -- it yields the whole ``2N`` BdG spectrum in
+one pass, the individual Majoranas as smooth signed curves, and the ``Z2``
+datum ``sign(det h(mu))`` from the frame.
+
+Singular-value source
+---------------------
+``sigma_source="head"`` (the default) takes ``Sigma = softplus(head_s)`` from
+a dedicated linear head. ``sigma_source="rayleigh"`` instead reads it off the
+frames, ``sigma_k = |u_k^T h(mu) v_k|`` -- there is then no head trying to
+regress an exponentially small number (``softplus`` has slope ``~ sigma``
+there, so a near-zero ``sigma_k`` is effectively frozen), only the two
+``O(1)`` orthogonal frames are learned, and the Frobenius residual
+``||h V - U diag(Sigma)||_F`` reduces to ``||offdiag(U^T h V)||_F`` plus a
+soft push for ``u_k^T h v_k >= 0``.
 
 The determinant reflection
 -------------------------
@@ -86,10 +97,10 @@ class SirenPINNChiralFull(nn.Module):
     The network maps the chemical potential to two orthogonal frames and a
     non-negative singular spectrum:
 
-        mu -> SIREN backbone -> features -> (skew_u, skew_v, s_raw)
+        mu -> SIREN backbone -> features -> (skew_u, skew_v[, s_raw])
             -> U = matrix_exp(fill_skew(skew_u))            in SO(N)
                V = matrix_exp(fill_skew(skew_v)) . R(mu)    in O(N)
-               Sigma = softplus(s_raw)                      >= 0
+               Sigma = softplus(s_raw)  or  |diag(U^T h V)| >= 0
 
     where ``R(mu) = diag(1, ..., 1, sign(det h(mu)))`` is the analytic
     last-column reflection (see the module docstring). ``Sigma`` is returned
@@ -103,7 +114,8 @@ class SirenPINNChiralFull(nn.Module):
         head_u: Linear head for the ``N (N - 1) / 2`` free parameters of the
             skew generator of ``U``.
         head_v: Linear head for the skew generator of ``V``.
-        head_s: Linear head for the pre-``softplus`` singular values.
+        head_s: Linear head for the pre-``softplus`` singular values, or
+            ``None`` when ``sigma_source="rayleigh"``.
         D: Buffer holding ``(-1)^n``, used for the ``mu -> -mu`` fold.
 
     Args:
@@ -114,9 +126,13 @@ class SirenPINNChiralFull(nn.Module):
         hidden_omega_0: Frequency parameter for every hidden SIREN layer.
         input_scale: Divides ``|mu|`` before the first SIREN layer. The
             default of ``4.0`` matches the ``mu`` in ``[0, 4 t]`` domain.
-        hopping: Nearest-neighbour hopping amplitude, ``t``. Used only for
-            the analytic ``sign(det h(mu))`` reflection.
+        hopping: Nearest-neighbour hopping amplitude, ``t``. Used for the
+            analytic ``sign(det h(mu))`` reflection and, under
+            ``sigma_source="rayleigh"``, to rebuild ``h(mu)``.
         pairing: P-wave pairing amplitude, ``delta``. Likewise.
+        sigma_source: ``"head"`` (default) for ``softplus(head_s)``, or
+            ``"rayleigh"`` for ``sigma_k = |u_k^T h(mu) v_k|`` with no
+            singular-value head.
     """
 
     D: torch.Tensor
@@ -132,6 +148,7 @@ class SirenPINNChiralFull(nn.Module):
         input_scale: float = 4.0,
         hopping: float = 1.0,
         pairing: float = 0.5,
+        sigma_source: str = "head",
     ) -> None:
         """Initialise the full-SVD chiral SIREN PINN.
 
@@ -144,11 +161,20 @@ class SirenPINNChiralFull(nn.Module):
                 layer (the first layer always uses ``30.0``).
             input_scale: Divides ``|mu|`` before the first SIREN layer.
             hopping: Hopping amplitude ``t`` for the ``sign(det h(mu))``
-                reflection of ``V``.
+                reflection of ``V`` and the ``"rayleigh"`` singular values.
             pairing: Pairing amplitude ``delta`` for the same.
+            sigma_source: ``"head"`` (default) or ``"rayleigh"`` -- see the
+                class docstring.
+
+        Raises:
+            ValueError: If ``sigma_source`` is not ``"head"`` or
+                ``"rayleigh"``.
         """
         super().__init__()
 
+        if sigma_source not in ("head", "rayleigh"):
+            raise ValueError("sigma_source must be 'head' or 'rayleigh'.")
+        self.sigma_source = sigma_source
         self.n_sites = n_sites
         self.in_features = in_features
         self.hidden_features = hidden_features
@@ -180,13 +206,18 @@ class SirenPINNChiralFull(nn.Module):
 
         self.head_u = nn.Linear(self.hidden_features, self.skew_dim)
         self.head_v = nn.Linear(self.hidden_features, self.skew_dim)
-        self.head_s = nn.Linear(self.hidden_features, self.n_sites)
+        self.head_s: nn.Linear | None = (
+            nn.Linear(self.hidden_features, self.n_sites)
+            if sigma_source == "head"
+            else None
+        )
 
         bound = math.sqrt(6.0 / self.hidden_features) / self.hidden_omega_0
         with torch.no_grad():
             self.head_u.weight.uniform_(-bound, bound)
             self.head_v.weight.uniform_(-bound, bound)
-            self.head_s.weight.uniform_(-bound, bound)
+            if self.head_s is not None:
+                self.head_s.weight.uniform_(-bound, bound)
 
         signs = torch.tensor(
             [(-1.0) ** n for n in range(self.n_sites)],
@@ -216,7 +247,6 @@ class SirenPINNChiralFull(nn.Module):
 
         u_mat = torch.matrix_exp(fill_skew(self.head_u(features), self.n_sites))
         v_so = torch.matrix_exp(fill_skew(self.head_v(features), self.n_sites))
-        sigma = F.softplus(self.head_s(features))
 
         # Last-column reflection so det V = sign(det h(mu)); s is analytic
         # and detached, contributing no gradient.
@@ -231,6 +261,15 @@ class SirenPINNChiralFull(nn.Module):
         d_row = self.D.reshape(1, self.n_sites, 1)
         u_mat = torch.where(is_negative, -(d_row * u_mat), u_mat)
         v_mat = torch.where(is_negative, d_row * v_mat, v_mat)
+
+        if self.head_s is not None:
+            sigma = F.softplus(self.head_s(features))
+        else:
+            # Rayleigh readout: sigma_k = |u_k^T h(mu) v_k|. No head regresses
+            # an exponentially small number; the diag of U^T h V is fold-
+            # invariant, so it is taken on the post-fold frames at mu.
+            h_batch = chiral_block_batched(x, self.n_sites, self.hopping, self.pairing)
+            sigma = torch.einsum("bik,bij,bjk->bk", u_mat, h_batch, v_mat).abs()
 
         return u_mat, sigma, v_mat
 

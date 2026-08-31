@@ -154,6 +154,83 @@ class TestSirenPINNChiralFull(TestCase):
         self.assertFalse(torch.isnan(x.grad).any())
 
 
+class TestSirenPINNChiralFullRayleigh(TestCase):
+    """sigma_source='rayleigh': sigma read off the frames, no head_s."""
+
+    def test_invalid_sigma_source_raises(self):
+        with self.assertRaises(ValueError):
+            SirenPINNChiralFull(n_sites=4, sigma_source="learned")
+
+    def test_no_singular_value_head(self):
+        model = SirenPINNChiralFull(n_sites=6, sigma_source="rayleigh")
+        self.assertIsNone(model.head_s)
+        names = {name for name, _ in model.named_parameters()}
+        self.assertFalse(any(name.startswith("head_s") for name in names))
+
+    def test_forward_shapes_and_non_negative(self):
+        model = SirenPINNChiralFull(n_sites=8, sigma_source="rayleigh")
+        u_mat, sigma, v_mat = model(torch.linspace(0.05, 4.0, 12).unsqueeze(-1))
+        self.assertEqual(u_mat.shape, (12, 8, 8))
+        self.assertEqual(sigma.shape, (12, 8))
+        self.assertEqual(v_mat.shape, (12, 8, 8))
+        self.assertGreaterEqual(sigma.min().item(), 0.0)
+
+    def test_sigma_is_the_frame_bilinear_readout(self):
+        """sigma_k == |diag(U^T h V)|_k, recomputed independently."""
+        model = SirenPINNChiralFull(
+            n_sites=8, hopping=T, pairing=DELTA, sigma_source="rayleigh"
+        ).double()
+        x = torch.linspace(-3.5, 3.5, 21, dtype=torch.float64).unsqueeze(-1)
+        u_mat, sigma, v_mat = model(x)
+        h_batch = chiral_block_batched(x, 8, T, DELTA)
+        want = torch.einsum("bik,bij,bjk->bk", u_mat, h_batch, v_mat).abs()
+        self.assertTrue(torch.allclose(sigma, want, atol=1e-12))
+
+    def test_residual_equals_offdiagonal_of_u_t_h_v(self):
+        """With this sigma the Frobenius residual is ||offdiag(U^T h V)||_F^2."""
+        model = SirenPINNChiralFull(
+            n_sites=6, hopping=T, pairing=DELTA, sigma_source="rayleigh"
+        ).double()
+        x = torch.tensor([[0.6], [1.4], [2.7]], dtype=torch.float64)
+        u_mat, sigma, v_mat = model(x)
+        h_batch = chiral_block_batched(x, 6, T, DELTA)
+        resid = torch.bmm(h_batch, v_mat) - u_mat * sigma.unsqueeze(1)
+        m = torch.einsum("bik,bij,bjl->bkl", u_mat, h_batch, v_mat)
+        off = m - torch.diag_embed(torch.diagonal(m, dim1=-2, dim2=-1))
+        # equal up to the soft non-negativity term 4 * sum_{m_kk < 0} m_kk^2
+        neg = torch.clamp(torch.diagonal(m, dim1=-2, dim2=-1), max=0.0)
+        self.assertTrue(
+            torch.allclose(
+                (resid**2).sum(dim=(-2, -1)),
+                (off**2).sum(dim=(-2, -1)) + 4.0 * (neg**2).sum(dim=-1),
+                atol=1e-10,
+            )
+        )
+
+    def test_differentiability_without_head_s(self):
+        model = SirenPINNChiralFull(
+            n_sites=4, hopping=T, pairing=DELTA, sigma_source="rayleigh"
+        )
+        x = torch.randn(3, 1, requires_grad=True)
+        u_mat, sigma, v_mat = model(x)
+        (u_mat.sum() + sigma.sum() + v_mat.sum()).backward()
+        assert x.grad is not None
+        self.assertFalse(torch.isnan(x.grad).any())
+        for parameter in model.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertFalse(torch.isnan(parameter.grad).any())
+
+    def test_adapter_round_trip(self):
+        model = SirenPINNChiralFull(
+            n_sites=7, hopping=T, pairing=DELTA, sigma_source="rayleigh"
+        )
+        adapter = ChiralFullToBdGAdapter(model, hopping=T, pairing=DELTA)
+        energy_pred, psi_pred = adapter(torch.tensor([[0.5], [2.3]]))
+        self.assertEqual(energy_pred.shape, (2, 1))
+        self.assertEqual(psi_pred.shape, (2, 14))
+        self.assertEqual(adapter.full_spectrum(torch.randn(5, 1)).shape, (5, 14))
+
+
 class TestChiralFullToBdGAdapter(TestCase):
     """The adapter exposes the smallest triple as a dual-head (E, psi) model."""
 
