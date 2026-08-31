@@ -17,11 +17,14 @@ HOPPING = 1.0
 PAIRING = 0.5
 METRIC_KEYS = {
     "svd",
+    "svd_weighted",
     "sigma_min_mean",
     "sigma_max_mean",
     "ortho_u",
     "gauge",
     "gauge_wt",
+    "reweight_eps",
+    "curriculum_wt",
 }
 
 
@@ -66,6 +69,28 @@ class _ExactSVD(torch.nn.Module):
         )
 
 
+class _PerturbedExactSVD(_ExactSVD):
+    """Exact SVD frames with one column of ``U`` shifted by a constant.
+
+    ``np.linalg.svd`` orders the singular values descending, so ``column=0``
+    corrupts the largest-``sigma`` triple and ``column=n_sites - 1`` the
+    smallest.
+    """
+
+    def __init__(self, n_sites: int, *, column: int, delta: float) -> None:
+        super().__init__(n_sites)
+        self.column = column
+        self.delta = delta
+
+    def forward(
+        self, mu_batch: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        u_mat, sigma, v_mat = super().forward(mu_batch)
+        u_mat = u_mat.clone()
+        u_mat[:, :, self.column] = u_mat[:, :, self.column] + self.delta
+        return u_mat, sigma, v_mat
+
+
 class _ConstantFrame(torch.nn.Module):
     """Returns a fixed (U, sigma, V) regardless of mu -- a smooth frame."""
 
@@ -99,6 +124,11 @@ def test_returns_scalar_loss_and_all_metric_keys(model, loss_fn, mu_batch) -> No
     assert all(math.isfinite(value) for value in metrics.values())
     assert metrics["gauge_wt"] == 0.0
     assert metrics["gauge"] == 0.0
+    # With both conditioning options off the weighted residual is the raw
+    # residual and the reporting knobs sit at their neutral values.
+    assert metrics["svd_weighted"] == metrics["svd"]
+    assert metrics["reweight_eps"] == 0.0
+    assert metrics["curriculum_wt"] == 1.0
 
 
 def test_gradients_flow_to_model_parameters(model, loss_fn, mu_batch) -> None:
@@ -175,6 +205,125 @@ def test_pointwise_residual_shape_and_exact_frames(loss_fn) -> None:
     assert residual.shape == (3,)
     assert torch.all(residual >= 0.0)
     assert torch.allclose(residual, torch.zeros(3, dtype=torch.float64), atol=1e-10)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"reweight_eps": 0.0},
+        {"reweight_eps": -1e-3},
+        {"curriculum_triples": -1},
+        {"curriculum_triples": N_SITES + 1},
+        {"curriculum_hold": -1},
+        {"curriculum_ramp": 0},
+        {"curriculum_start": -0.1},
+        {"curriculum_start": 1.5},
+    ],
+)
+def test_invalid_configuration_raises(kwargs) -> None:
+    with pytest.raises(ValueError):
+        ChiralSVDLoss(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING, **kwargs)
+
+
+def test_reweighting_leaves_the_raw_residual_and_the_exact_case_untouched() -> None:
+    mu_batch = torch.tensor([[0.5], [1.5], [2.5]], dtype=torch.float64)
+    plain = ChiralSVDLoss(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+    reweighted = ChiralSVDLoss(
+        n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING, reweight_eps=1e-2
+    )
+    corrupt = _PerturbedExactSVD(N_SITES, column=0, delta=1e-3)
+
+    _l_plain, m_plain = plain(corrupt, mu_batch, None, None, None, epoch=0)
+    _l_rw, m_rw = reweighted(corrupt, mu_batch, None, None, None, epoch=0)
+
+    # The reported raw Frobenius residual is independent of the reweighting.
+    assert m_rw["svd"] == pytest.approx(m_plain["svd"], rel=1e-9)
+    assert m_rw["reweight_eps"] == 1e-2
+
+    # Exact frames still drive the weighted objective to zero.
+    _l_exact, m_exact = reweighted(
+        _ExactSVD(N_SITES), mu_batch, None, None, None, epoch=0
+    )
+    assert m_exact["svd_weighted"] == pytest.approx(0.0, abs=1e-10)
+
+
+def test_reweighting_rebalances_error_away_from_the_large_sigma_column() -> None:
+    mu_batch = torch.tensor([[1.5]], dtype=torch.float64)
+    plain = ChiralSVDLoss(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+    reweighted = ChiralSVDLoss(
+        n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING, reweight_eps=1e-2
+    )
+    small_bad = _PerturbedExactSVD(N_SITES, column=N_SITES - 1, delta=1e-3)
+    big_bad = _PerturbedExactSVD(N_SITES, column=0, delta=1e-3)
+
+    _l, m_small_plain = plain(small_bad, mu_batch, None, None, None, epoch=0)
+    _l, m_big_plain = plain(big_bad, mu_batch, None, None, None, epoch=0)
+    _l, m_small_rw = reweighted(small_bad, mu_batch, None, None, None, epoch=0)
+    _l, m_big_rw = reweighted(big_bad, mu_batch, None, None, None, epoch=0)
+
+    # Plain: the same frame error costs far more on the large-sigma column,
+    # so the smallest triple is comparatively starved.
+    ratio_plain = m_small_plain["svd_weighted"] / m_big_plain["svd_weighted"]
+    # Reweighted: the 1/sigma^2 floor compresses that imbalance toward 1.
+    ratio_rw = m_small_rw["svd_weighted"] / m_big_rw["svd_weighted"]
+    assert ratio_plain < 1.0
+    assert ratio_rw > ratio_plain
+
+
+def test_curriculum_fraction_schedule() -> None:
+    disabled = ChiralSVDLoss(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)
+    assert disabled._curriculum_fraction(0) == 1.0
+
+    loss = ChiralSVDLoss(
+        n_sites=N_SITES,
+        hopping=HOPPING,
+        pairing=PAIRING,
+        curriculum_triples=2,
+        curriculum_hold=100,
+        curriculum_ramp=200,
+        curriculum_start=0.0,
+    )
+    assert loss._curriculum_fraction(50) == 0.0
+    assert loss._curriculum_fraction(100) == 0.0
+    assert loss._curriculum_fraction(200) == pytest.approx(0.5)
+    assert loss._curriculum_fraction(300) == 1.0
+    assert loss._curriculum_fraction(10_000) == 1.0
+
+
+def test_curriculum_excludes_and_then_readmits_the_smallest_triple() -> None:
+    mu_batch = torch.tensor([[0.5], [1.5], [2.5]], dtype=torch.float64)
+    loss = ChiralSVDLoss(
+        n_sites=N_SITES,
+        hopping=HOPPING,
+        pairing=PAIRING,
+        curriculum_triples=1,
+        curriculum_hold=100,
+        curriculum_ramp=100,
+        curriculum_start=0.0,
+    )
+    small_bad = _PerturbedExactSVD(N_SITES, column=N_SITES - 1, delta=1e-1)
+    big_bad = _PerturbedExactSVD(N_SITES, column=0, delta=1e-1)
+
+    # During the hold the smallest triple carries zero weight, so an error
+    # confined to it is invisible to the optimised objective ...
+    _l, m_hold = loss(small_bad, mu_batch, None, None, None, epoch=0)
+    assert m_hold["curriculum_wt"] == 0.0
+    assert m_hold["svd"] > 1e-8
+    assert m_hold["svd_weighted"] == pytest.approx(0.0, abs=1e-12)
+
+    # ... while an error on a bulk column is unaffected by the curriculum.
+    _l, m_hold_big = loss(big_bad, mu_batch, None, None, None, epoch=0)
+    _l, m_ref_big = ChiralSVDLoss(n_sites=N_SITES, hopping=HOPPING, pairing=PAIRING)(
+        big_bad, mu_batch, None, None, None, epoch=0
+    )
+    assert m_hold_big["svd_weighted"] == pytest.approx(
+        m_ref_big["svd_weighted"], rel=1e-9
+    )
+
+    # After the ramp every triple is back at full weight.
+    _l, m_done = loss(small_bad, mu_batch, None, None, None, epoch=10_000)
+    assert m_done["curriculum_wt"] == 1.0
+    assert m_done["svd_weighted"] == pytest.approx(m_done["svd"], rel=1e-9)
 
 
 if __name__ == "__main__":

@@ -687,9 +687,35 @@ class ChiralSVDLoss(BaseLoss):
     (e.g. ``1e-3``) is used only when cross-seed frame agreement is being
     measured.
 
-    ``H_base``, ``H_mu_diag``, ``Xi`` and ``epoch`` are accepted for the
+    **Conditioning the smallest triple.** The bare residual weights column
+    ``k`` by ``sigma_k`` -- the term for a near-zero singular value
+    contributes ``~ sigma_k^2`` to the Frobenius norm and is swamped by the
+    ``O(t)`` bulk columns, so the exponentially small topological triple is
+    gradient-starved and ``sigma_min(mu)`` plateaus well above its true
+    value. Two default-off options address this and compose:
+
+    - ``reweight_eps``: divide each column's squared residual by
+      ``sigma_k^2 + reweight_eps^2`` (the weight is detached, so it cannot
+      be gamed by inflating ``sigma_k``). This is ``~ sigma_k^-2`` for
+      ``sigma_k >> reweight_eps`` and saturates at ``~ reweight_eps^-2``
+      for ``sigma_k << reweight_eps``, so every triple contributes
+      comparably with the near-zero column's up-weighting bounded. The
+      smooth ``sigma^2 + eps^2`` form (rather than
+      ``max(sigma, eps)^2``) has no kink, so it does not break the
+      L-BFGS phase's quasi-Newton curvature estimate. A mild
+      folded-spectrum flavour, far gentler than the ``ChiralFSMLoss``
+      shift.
+    - ``curriculum_triples``: for the first ``curriculum_hold`` epochs the
+      ``curriculum_triples`` smallest predicted triples carry weight
+      ``curriculum_start`` (``0`` excludes them), so the network fits the
+      well-conditioned bulk frame first; the weight then rises linearly to
+      ``1.0`` over ``curriculum_ramp`` epochs. Keyed off ``epoch`` exactly
+      as the annealing schedules of the other losses.
+
+    ``H_base``, ``H_mu_diag`` and ``Xi`` are accepted for the
     :class:`BaseLoss` call contract but unused; the loss builds its own
-    ``h(mu)`` from ``mu_batch``.
+    ``h(mu)`` from ``mu_batch``. ``epoch`` is used only by the optional
+    curriculum.
 
     Attributes:
         n_sites: Number of physical lattice sites, ``N``.
@@ -697,6 +723,16 @@ class ChiralSVDLoss(BaseLoss):
         pairing: P-wave pairing amplitude, ``delta``.
         gauge_weight: Weight of the optional frame-smoothness term.
         gauge_delta: Finite-difference step in ``mu`` for that term.
+        reweight_eps: Floor for the per-column ``1 / sigma_k^2``
+            reweighting, or ``None`` to disable it.
+        curriculum_triples: Number of smallest triples under the curriculum
+            weight, or ``0`` to disable the curriculum.
+        curriculum_hold: Epochs the curriculum weight is held at
+            ``curriculum_start``.
+        curriculum_ramp: Epochs over which the curriculum weight rises to
+            ``1.0``.
+        curriculum_start: The held (initial) curriculum weight, in
+            ``[0, 1]``.
     """
 
     def __init__(
@@ -707,6 +743,11 @@ class ChiralSVDLoss(BaseLoss):
         pairing: float = 0.5,
         gauge_weight: float = 0.0,
         gauge_delta: float = 1e-2,
+        reweight_eps: float | None = None,
+        curriculum_triples: int = 0,
+        curriculum_hold: int = 500,
+        curriculum_ramp: int = 1000,
+        curriculum_start: float = 0.0,
     ) -> None:
         """Initialise the loss with the chain's physical parameters.
 
@@ -717,12 +758,63 @@ class ChiralSVDLoss(BaseLoss):
             gauge_weight: Weight of the finite-difference frame-smoothness
                 term. ``0.0`` (the default) disables it entirely.
             gauge_delta: Step in ``mu`` used by the smoothness term.
+            reweight_eps: Positive floor for the per-column
+                ``1 / (sigma_k^2 + reweight_eps^2)`` reweighting.
+                ``None`` (the default) disables the reweighting.
+            curriculum_triples: Number of smallest predicted triples placed
+                under the epoch-keyed curriculum weight. ``0`` (the
+                default) disables the curriculum.
+            curriculum_hold: Epochs to hold the curriculum weight at
+                ``curriculum_start`` before ramping.
+            curriculum_ramp: Epochs over which the curriculum weight rises
+                linearly from ``curriculum_start`` to ``1.0``.
+            curriculum_start: The held (initial) curriculum weight, in
+                ``[0, 1]``.
+
+        Raises:
+            ValueError: If ``reweight_eps`` is not positive, if
+                ``curriculum_triples`` is outside ``[0, n_sites]``, if
+                ``curriculum_hold`` is negative, if ``curriculum_ramp`` is
+                below ``1``, or if ``curriculum_start`` is outside
+                ``[0, 1]``.
         """
+        if reweight_eps is not None and reweight_eps <= 0.0:
+            raise ValueError("reweight_eps must be positive when set.")
+        if not 0 <= curriculum_triples <= n_sites:
+            raise ValueError("curriculum_triples must lie in [0, n_sites].")
+        if curriculum_hold < 0:
+            raise ValueError("curriculum_hold must be non-negative.")
+        if curriculum_ramp < 1:
+            raise ValueError("curriculum_ramp must be at least 1.")
+        if not 0.0 <= curriculum_start <= 1.0:
+            raise ValueError("curriculum_start must lie in [0, 1].")
+
         self.n_sites = n_sites
         self.hopping = hopping
         self.pairing = pairing
         self.gauge_weight = gauge_weight
         self.gauge_delta = gauge_delta
+        self.reweight_eps = reweight_eps
+        self.curriculum_triples = curriculum_triples
+        self.curriculum_hold = curriculum_hold
+        self.curriculum_ramp = curriculum_ramp
+        self.curriculum_start = curriculum_start
+
+    def _curriculum_fraction(self, epoch: int) -> float:
+        """The curriculum weight on the smallest triples at ``epoch``.
+
+        ``1.0`` when the curriculum is disabled; otherwise
+        ``curriculum_start`` through the hold, then linear to ``1.0`` over
+        ``curriculum_ramp`` epochs, then ``1.0``.
+        """
+        if self.curriculum_triples == 0:
+            return 1.0
+        if epoch <= self.curriculum_hold:
+            return self.curriculum_start
+        progress = (epoch - self.curriculum_hold) / self.curriculum_ramp
+        if progress >= 1.0:
+            return 1.0
+        return self.curriculum_start + (1.0 - self.curriculum_start) * progress
 
     def __call__(
         self,
@@ -744,15 +836,18 @@ class ChiralSVDLoss(BaseLoss):
             H_base: Unused (kept for the :class:`BaseLoss` contract).
             H_mu_diag: Unused.
             Xi: Unused.
-            epoch: Unused (this loss has no annealing schedule).
+            epoch: Drives the optional curriculum weight; ignored when
+                ``curriculum_triples == 0``.
 
         Returns:
             Tuple of ``(total_loss, metrics)``, where ``metrics`` holds the
-            Frobenius residual, the mean smallest and largest singular
-            values, an orthogonality tripwire for ``U`` and the optional
-            gauge term with its weight.
+            raw Frobenius residual (``svd``), the actually-minimised
+            residual after any reweighting/curriculum (``svd_weighted``),
+            the mean smallest and largest singular values, an orthogonality
+            tripwire for ``U``, the optional gauge term with its weight,
+            the reweighting floor and the current curriculum weight.
         """
-        del H_base, H_mu_diag, Xi, epoch
+        del H_base, H_mu_diag, Xi
 
         u_mat, sigma, v_mat = model(mu_batch)
         h_batch = chiral_block_batched(
@@ -760,7 +855,24 @@ class ChiralSVDLoss(BaseLoss):
         )
 
         resid = torch.bmm(h_batch, v_mat) - u_mat * sigma.unsqueeze(1)
-        loss_svd = torch.mean(resid**2)
+        loss_resid = torch.mean(resid**2)
+
+        curriculum_frac = self._curriculum_fraction(epoch)
+        if self.reweight_eps is None and self.curriculum_triples == 0:
+            loss_svd = loss_resid
+        else:
+            col_sq = (resid**2).sum(dim=1)  # (batch, N): per-column residual
+            col_weight = torch.ones_like(col_sq)
+            if self.reweight_eps is not None:
+                col_weight = col_weight / (sigma**2 + self.reweight_eps**2)
+            if self.curriculum_triples > 0:
+                smallest = torch.topk(
+                    sigma, self.curriculum_triples, dim=1, largest=False
+                ).indices
+                ramp = torch.ones_like(col_sq)
+                ramp.scatter_(1, smallest, curriculum_frac)
+                col_weight = col_weight * ramp
+            loss_svd = torch.mean(col_sq * col_weight.detach()) / self.n_sites
 
         eye = torch.eye(self.n_sites, device=u_mat.device, dtype=u_mat.dtype)
         ortho_u = torch.mean((torch.bmm(u_mat.transpose(1, 2), u_mat) - eye) ** 2)
@@ -776,12 +888,15 @@ class ChiralSVDLoss(BaseLoss):
         total_loss = loss_svd + self.gauge_weight * loss_gauge
 
         return total_loss, {
-            "svd": loss_svd.item(),
+            "svd": loss_resid.item(),
+            "svd_weighted": loss_svd.item(),
             "sigma_min_mean": sigma.min(dim=1).values.mean().item(),
             "sigma_max_mean": sigma.max(dim=1).values.mean().item(),
             "ortho_u": ortho_u.item(),
             "gauge": loss_gauge.item(),
             "gauge_wt": self.gauge_weight,
+            "reweight_eps": self.reweight_eps if self.reweight_eps is not None else 0.0,
+            "curriculum_wt": curriculum_frac,
         }
 
 
